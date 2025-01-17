@@ -6,123 +6,57 @@ import geopandas as gpd
 import pandas as pd
 from pygeotools.lib import iolib,malib
 from tqdm import tqdm
-from p_tqdm import p_umap
+from p_tqdm import p_umap, p_map
 from skysat_stereo import skysat
 from skysat_stereo import asp_utils as asp
 from rpcm import geo
 from skysat_stereo import misc_geospatial as misc
+import subprocess
 from shapely.geometry import Polygon
 import itertools
-from osgeo import osr
 from pyproj import Transformer
+import xarray as xr
+import rioxarray as rxr
+import matplotlib.pyplot as plt
+import matplotlib
 
-
-def prepare_stereopair_list_rtree(img_folder,perc_overlap,out_fn,aoi_bbox=None,cross_track=False):
+def run_cmd(bin, args, **kw):
     """
+    wrapper around subprocess function to excute bash commands
     Parameters
-    ------------
-    img_folder: str
-        path to folder containing images
-    perc_overlap: float
-        minimum percentage overlap to qualify as stereo pair (0 to 1)
-    out_fn: str
-        path to output file where overlap list is saved
-    aoi_bbox:str
-        path to aoi shapefile within which pairs are restricted to
-    cross_track: bool
-        If True, also form cross_track pairs
-    Returns
-    ------------
-    stereo_only_df: pd.Dataframe 
-        overlap list with only along-track stereo pairs
-    out_df: pd.Dataframe
-        overlap_list with pairs formed from all intersecting image pairs
-    
-    
-    """ 
-    from itertools import combinations
-    from p_tqdm import p_map
-    geo_crs = 'EPSG:4326'
-    # populate img list
+    ----------
+    bin: str
+        command to be excuted (e.g., stereo or gdalwarp)
+    args: list
+        arguments to the command as a list
+    Retuns
+    ----------
+    out: str
+        log (stdout) as str if the command executed, error message if the command failed
+    """
+    #Note, need to add full executable
+    # binpath = '/Users/raineyaberle/Research/PhD/SnowDEMs/StereoPipeline-3.5.0-alpha-2024-10-05-x86_64-OSX/bin/' + bin
+    binpath = shutil.which(bin)
+    # print(binpath)
+    if binpath is None:
+        msg = ("Unable to find executable %s\n"
+        "Install ASP and ensure it is in your PATH env variable\n"
+       "https://ti.arc.nasa.gov/tech/asr/intelligent-robotics/ngt/stereo/" % bin)
+        sys.exit(msg)
+    call = [binpath,]
+    if args is not None: 
+        call.extend(args)
+    print(call)
     try:
-        img_list = sorted(glob.glob(os.path.join(img_folder,'*.tif')))
-        print("Number of images {}".format(len(img_list)))
+        out = subprocess.run(call,check=True,capture_output=True,encoding='UTF-8').stdout
     except:
-        print ("No images found in the directory. Make sure they end with a .tif extension")
-        sys.exit()
-    out_shp = os.path.splitext(out_fn)[0]+'_bound.gpkg'
-    n_proc = iolib.cpu_count()
-    shp_list = p_map(skysat.skysat_footprint,img_list,num_cpus=2*n_proc)
-    merged_shape = misc.shp_merger(shp_list)
-    bbox = merged_shape.total_bounds
-    merged_shape = misc.shp_merger(shp_list)
-    id = [os.path.basename(x) for x in merged_shape.img.values]
-    merged_shape['id'] = id
-    bbox = merged_shape.total_bounds
-    print (f'Bounding box lon_lat is:{bbox}')
-    print (f'Bounding box lon_lat is:{bbox}')
-    bound_poly = Polygon([[bbox[0],bbox[3]],[bbox[2],bbox[3]],[bbox[2],bbox[1]],[bbox[0],bbox[1]]])
-    bound_shp = gpd.GeoDataFrame(index=[0],geometry=[bound_poly],crs=geo_crs)
-    bound_centroid = bound_shp.centroid
-    cx = bound_centroid.x.values[0]
-    cy = bound_centroid.y.values[0]
-    pad = np.ptp([bbox[3],bbox[1]])/6.0
-    lat_1 = bbox[1]+pad
-    lat_2 = bbox[3]-pad
-    #local_ortho = '+proj=ortho +lat_0={} +lon_0={}'.format(cy,cx)
-    local_aea = "+proj=aea +lat_1={} +lat_2={} +lat_0={} +lon_0={} +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs".format(lat_1,lat_2,cy,cx)
-    print ('Local Equal Area coordinate system is : {} \n'.format(local_aea))
-    print('Saving bound shapefile at {} \n'.format(out_shp))
-    bound_shp.to_file(out_shp,driver='GPKG')
-    
-    # condition to check bbox_aoi
-    if aoi_bbox is not None:
-        bbox = gpd.read_file(aoi_bbox)
-        mask = merged_shape.to_crs(bbox.crs).intersects(bbox)
-        #img_list = merged_shape[mask].img.values
+        out = "the command {} failed to run, see corresponding asp log".format(call)
+    return out
 
-    
-    
-    
-    gdf = merged_shape.to_crs(local_aea)
-    gdf['area'] = gdf.geometry.area
-    valid_combinations = list(combinations(gdf.id.values,2))
-    n_comb = len(valid_combinations)
-    # we use this later to prevent non-unique contributions
-    valid_combinations = [f'{x[0]}__{x[1]}' for x in valid_combinations]
-    def make_sep(row):
-        return f"{row['id_1']}__{row['id_2']}"
-    gdf = gpd.overlay(gdf,gdf,how='intersection')
-    gdf['sep1'] = gdf.apply(make_sep,axis=1)
-    valid_gdf = gdf[gdf['sep1'].isin(valid_combinations)]
-    valid_gdf['area_intsec'] = valid_gdf.geometry.area
-    valid_gdf['area_intersect_perc'] = valid_gdf['area_intsec']/valid_gdf['area_1']
-    m_area = valid_gdf['area_intersect_perc'] > perc_overlap
-    valid_gdf = valid_gdf[m_area]
-
-
-    print('Number of valid combinations are {}, out of total {}  input images making total combinations {}\n'.format(len(valid_gdf),len(img_list),len(valid_combinations)))
-    #to mantain compatibility with old code in the first file
-    valid_gdf['abs_img1'] = [os.path.abspath(img) for img in valid_gdf.img_1.values]
-    valid_gdf['abs_img2'] = [os.path.abspath(img) for img in valid_gdf.img_2.values]
-    valid_gdf[['abs_img1','abs_img2']].to_csv(out_fn,sep=' ',header=False,index=False)
-    
-    out_fn_overlap = os.path.splitext(out_fn)[0]+'_with_overlap_perc.pkl'
-    out_df = pd.DataFrame({'img1':valid_gdf['img_1'].values,'img2':valid_gdf['img_2'].values,'overlap_perc':valid_gdf['area_intersect_perc'].values})
-    out_df.to_pickle(out_fn_overlap)
-    
-    out_fn_stereo = os.path.splitext(out_fn_overlap)[0]+'_stereo_only.pkl'
-    stereo_only_df = skysat.prep_trip_df(out_fn_overlap,cross_track=cross_track)
-    stereo_only_df.to_pickle(out_fn_stereo)
-    out_fn_stereo_ba = os.path.splitext(out_fn_overlap)[0]+'_stereo_only.txt'
-    stereo_only_df[['img1','img2']].to_csv(out_fn_stereo_ba,sep=' ',header=False,index=False)
-    
-    return stereo_only_df, out_df
 
 def prepare_stereopair_list(img_folder,perc_overlap,out_fn,aoi_bbox=None,cross_track=False):
     """
     """ 
-    from p_tqdm import p_map
     geo_crs = 'EPSG:4326'
     # populate img list
     try:
@@ -191,22 +125,22 @@ def prepare_stereopair_list(img_folder,perc_overlap,out_fn,aoi_bbox=None,cross_t
     
     return stereo_only_df, out_df
 
-def skysat_preprocess(img_folder,mode,sampling=None,frame_index_fn=None,product_level='l1a',
+
+def skysat_preprocess(img_folder,mode,sampling=None,frame_index=None,product_level='l1a',
         sampler=5,overlap_pkl=None,dem=None,outdir=None):
     """
     """
-    from p_tqdm import p_map
     if not os.path.exists(outdir):
         try:
             os.makedir(outdir)
         except:
             os.makedirs(outdir)
     if mode == 'video':
-        outdf = os.path.join(outdir,os.path.basename(frame_index_fn))
-        frame_index = skysat.parse_frame_index(frame_index_fn,True)
+        frame_index = skysat.parse_frame_index(frame_index,True)
         product_level = 'l1a'
         num_samples = len(frame_index)
         frames = frame_index.name.values
+        outdf = os.path.join(outdir,os.path.basename(frame_index))
         if sampling == 'sampling_interval':
             print("Hardcoded sampling interval results in frame exclusion at the end of the video sequence based on step size, better to chose the num_images mode and the program will equally distribute accordingly")
             idx = np.arange(0,num_samples,sampler)
@@ -215,22 +149,18 @@ def skysat_preprocess(img_folder,mode,sampling=None,frame_index_fn=None,product_
             print("Sampling {} from {} of the input video sequence".format(sampler,num_samples))
             idx = np.linspace(0,num_samples-1,sampler,dtype=int)
             outdf = '{}_sampling_inteval_aprox{}.csv'.format(os.path.splitext(outdf)[0],idx[1]-idx[0])
-        
         sub_sampled_frames = frames[idx]
         sub_df = frame_index[frame_index['name'].isin(list(sub_sampled_frames))]
         sub_df.to_csv(outdf,sep=',',index=False)
-
         #this is camera/gcp initialisation
         n = len(sub_sampled_frames)
-        print(f"Number of subsampled frames = {n}")
         img_list = [glob.glob(os.path.join(img_folder,'{}*.tiff'.format(frame)))[0] for frame in sub_sampled_frames]
         pitch = [1]*n
         out_fn = [os.path.join(outdir,'{}_frame_idx.tsai'.format(frame)) for frame in sub_sampled_frames]
         out_gcp = [os.path.join(outdir,'{}_frame_idx.gcp'.format(frame)) for frame in sub_sampled_frames]
-        frame_index_fn = [frame_index_fn]*n
-       	camera = [None]*n
+        frame_index = [frame_index]*n
+        camera = [None]*n
         gcp_factor = 4
-
     elif mode == 'triplet':
         df = pd.read_pickle(overlap_pkl)
         img_list = list(np.unique(np.array(list(df.img1.values)+list(df.img2.values))))
@@ -244,32 +174,321 @@ def skysat_preprocess(img_folder,mode,sampling=None,frame_index_fn=None,product_
         out_fn = [os.path.join(outdir,'{}_rpc.tsai'.format(frame)) for frame in img_list]
         out_gcp = [os.path.join(outdir,'{}_rpc.gcp'.format(frame)) for frame in img_list]
         camera = cam_list
-        frame_index_fn = [None]*n
+        frame_index = [None]*n
         img_list = cam_list
         gcp_factor = 8
-
     fl = [553846.153846]*n
     cx = [1280]*n
     cy = [540]*n
-    ht_datum = [malib.get_stats_dict(iolib.fn_getma(dem))['median']]*n # use this value for height where DEM has no-data
+    dem
+    ht_datum = [np.nanmedian(iolib.fn_getma(dem).data)]*n # use this value for height where DEM has no-data
     gcp_std = [1]*n
     datum = ['WGS84']*n
     refdem = [dem]*n
-    n_proc = 30
-    #n_proc = cpu_count()
+    n_proc = iolib.cpu_count()
+    if n_proc > 2:
+        n_proc -= 2
     print("Starting camera resection procedure")
-    cam_gen_log = p_map(asp.cam_gen,img_list,fl,cx,cy,pitch,ht_datum,gcp_std,out_fn,out_gcp,datum,refdem,camera,frame_index_fn,num_cpus = n_proc)
+    cam_gen_log = p_map(asp.cam_gen,img_list,fl,cx,cy,pitch,ht_datum,gcp_std,out_fn,out_gcp,datum,refdem,camera,frame_index,num_cpus = n_proc)
     print("writing gcp with basename removed")
     # count expexted gcp 
     print(f"Total expected GCP {gcp_factor*n}")    
     asp.clean_gcp(out_gcp,outdir)
+    
+    
     return cam_gen_log   
 
-def execute_skysat_orhtorectification(images,outdir,data='triplet',dem='WGS84',tr=None,tsrs=None,del_opt=False,cam_folder=None,ba_prefix=None,
+
+def construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold=0.5, ndsi_threshold=0.1, plot_results=True):
+    # Define output files
+    trees_mask_fn = os.path.join(out_dir, 'trees_mask.tif')
+    snow_mask_fn = os.path.join(out_dir, 'snow_mask.tif')
+    ss_mask_fn = os.path.join(out_dir, 'stable_surfaces_mask.tif')
+    fig_fn = os.path.join(out_dir, 'land_cover_masks.png')
+
+    # Function to load 4-band mosaic if needed
+    mosaic = None
+    def load_mosaic(multispec_mosaic_fn):
+        mosaic_xr = rxr.open_rasterio(multispec_mosaic_fn).astype(float)
+        crs = f'EPSG:{mosaic_xr.rio.crs.to_epsg()}'
+        mosaic = xr.Dataset(coords={'y': mosaic_xr.y, 'x':mosaic_xr.x})
+        bands = ['blue', 'green', 'red', 'NIR']
+        for i, b in enumerate(bands):
+            mosaic[b] = mosaic_xr.isel(band=i)
+        mosaic = mosaic / 1e4
+        mosaic = xr.where(mosaic==0, np.nan, mosaic)
+        mosaic.rio.write_crs(crs, inplace=True)
+        return mosaic, crs
+
+    # Construct trees mask
+    if not os.path.exists(trees_mask_fn):
+        print('Constructing trees mask...')
+        if not mosaic:
+            mosaic, crs = load_mosaic(multispec_mosaic_fn)
+        # Calculate NDVI
+        ndvi = (mosaic.NIR - mosaic.red) / (mosaic.NIR + mosaic.red)
+        # Apply threshold
+        trees_mask = (ndvi >= ndvi_threshold).astype(int)
+        # Save to file
+        trees_mask = xr.where(np.isnan(mosaic.blue), -9999, trees_mask) # set no data values to -9999
+        trees_mask = trees_mask.assign_attrs({'Description': 'Trees mask constructing by thresholding the NDVI of the 4-band mosaic image.',
+                                            '_FillValue': -9999,
+                                            'NDVI bands': 'NIR, green',
+                                            'NDVI threshold': ndvi_threshold})
+        trees_mask.rio.write_crs(crs, inplace=True)
+        trees_mask.rio.to_raster(trees_mask_fn, dtype='int16')
+        print('Trees mask saved to file:', trees_mask_fn)
+    else:
+        print('Trees mask exists in directory, skipping.')
+
+    # Construct snow mask
+    if not os.path.exists(snow_mask_fn):
+        print('Constructing snow mask...')
+        if not mosaic:
+            mosaic, crs = load_mosaic(multispec_mosaic_fn)
+        # Calculate NDSI
+        ndsi = (mosaic.red - mosaic.NIR) / (mosaic.red + mosaic.NIR)
+        # Apply threshold
+        snow_mask = (ndsi >= ndsi_threshold).astype(int)
+        # Save to file
+        snow_mask = xr.where(np.isnan(mosaic.blue), -9999, snow_mask) # set no data values to -9999
+        snow_mask = snow_mask.assign_attrs({'Description': 'Snow mask constructed by thresholding the NDSI of the orthomosaic image',
+                                            '_FillValue': -9999,
+                                            'NDSI bands': 'red, NIR',
+                                            'NDSI threshold': ndsi_threshold})
+        snow_mask.rio.write_crs(crs, inplace=True)
+        snow_mask.rio.to_raster(snow_mask_fn, dtype='int16')
+        print('Snow mask saved to file:', snow_mask_fn)
+    else:
+        print('Snow mask exists in directory, skipping.')
+
+    # Construct stable surfaces (snow-free and tree-free) mask
+    if not os.path.exists(ss_mask_fn):
+        print('Constructing stable surfaces mask...')
+        if not mosaic:
+            mosaic, crs = load_mosaic(multispec_mosaic_fn)
+        # Load trees and snow masks
+        trees_mask = rxr.open_rasterio(trees_mask_fn).squeeze()
+        snow_mask = rxr.open_rasterio(snow_mask_fn).squeeze()
+        # Stable surfaces = snow-free and tree-free
+        ss_mask = xr.where((trees_mask==0) & (snow_mask==0), 1, 0)
+        # Save to file
+        ss_mask = xr.where(np.isnan(mosaic.blue), -9999, ss_mask)
+        ss_mask = ss_mask.assign_attrs({'Description': 'Stable surfaces (snow-free and tree-free) mask.',
+                                        '_FillValue': -9999})
+        ss_mask.rio.write_crs(crs, inplace=True)
+        ss_mask.rio.to_raster(ss_mask_fn, dtype='int16')
+        print('Stable surfaces mask saved to file:', ss_mask_fn)
+    else: 
+        print('Stable surfaces mask exists in directory, skipping.')
+
+    # Plot land cover masks
+    if plot_results & (not os.path.exists(fig_fn)):
+        print('Plotting land cover masks...')
+        if not mosaic:
+            mosaic, crs = load_mosaic(multispec_mosaic_fn)
+        # Load masks
+        trees_mask = rxr.open_rasterio(trees_mask_fn).squeeze()
+        snow_mask = rxr.open_rasterio(snow_mask_fn).squeeze()
+        ss_mask = rxr.open_rasterio(ss_mask_fn).squeeze()
+        # Define land cover colors
+        colors_dict = {'trees': '#006d2c', 
+                       'snow': '#4292c6', 
+                       'stable_surfaces': '#bdbdbd'}
+        # Plot
+        fig, ax = plt.subplots(1, 2, figsize=(10,5))
+        # RGB image
+        ax[0].imshow(np.dstack([mosaic.red.data, mosaic.green.data, mosaic.blue.data]),
+                     extent=(np.min(mosaic.x)/1e3, np.max(mosaic.x)/1e3, np.min(mosaic.y)/1e3, np.max(mosaic.y)/1e3))
+        ax[0].set_title('RGB mosaic')
+        ax[0].set_xlabel('Easting [km]')
+        ax[0].set_ylabel('Northing [km]')
+        # Land cover masks
+        
+        for mask, label in zip([trees_mask, snow_mask, ss_mask], list(colors_dict.keys())):
+            cmap = matplotlib.colors.ListedColormap([(0,0,0,0), matplotlib.colors.to_rgb(colors_dict[label])])
+            ax[1].imshow(mask, cmap=cmap, clim=(0,1),
+                        extent=(np.min(mask.x)/1e3, np.max(mask.x)/1e3, np.min(mask.y)/1e3, np.max(mask.y)/1e3))
+            # dummy point for legend
+            ax[1].plot(0, 0, 's', color=colors_dict[label], markersize=10, label=label) 
+        ax[1].set_xlim(ax[0].get_xlim())
+        ax[1].set_ylim(ax[0].get_ylim())
+        ax[1].legend(loc='best')
+        ax[1].set_xlabel('Easting [km]')
+
+        # Save figure
+        fig.savefig(fig_fn, dpi=300, bbox_inches='tight')
+        print('Figure saved to file:', fig_fn)
+        plt.close()
+    elif plot_results:
+        print('Masks figure exists in directory, skipping plotting.')
+
+    return trees_mask_fn, snow_mask_fn, ss_mask_fn
+
+def prepare_reference_elevations(coreg_dem_fn, ortho_dem_fn, multispec_dir, bound_fn, bound_buffer_fn, out_dir, 
+                                 ndvi_threshold=0.5, ndsi_threshold=0.4, coreg_stable_only=False):
+    # Check if output directory exists
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+
+    # Determine optimal UTM zone and clipping bounds
+    print("Computing Target UTM zones for orthorectification")
+    gdf = gpd.read_file(bound_fn)
+    clon, clat = [gdf.centroid.x.values, gdf.centroid.y.values]
+    epsg_code = f'EPSG:{geo.compute_epsg(clon, clat)}'
+    print(f"Detected UTM zone is {epsg_code}")
+    if not os.path.exists(bound_buffer_fn):
+        print("Creating buffered shapefile")
+        gdf_proj = gdf.to_crs(epsg_code)
+        gdf_proj['geometry'] = gdf_proj.buffer(1000)
+        gdf_proj.to_file(bound_buffer_fn, driver='GPKG')
+    
+    # Check if multispec_dir is a directory of images or a single file
+    if os.path.isdir(multispec_dir):
+        multispec_mosaic_fn = os.path.join(out_dir, '4band_mosaic.tif')
+        # Check if mosaic exists
+        if not os.path.exists(multispec_mosaic_fn):
+            print('Mosacking 4-band SR images...')
+            # Grab all 4-band SR image file names
+            multispec_fns = sorted(glob.glob(os.path.join(multispec_dir, '*_SR.tif')))
+            # Construct gdal_merge arguments
+            merge_args = multispec_fns + ['--ot', 'Int16', '--no-bigtiff', '-o', multispec_mosaic_fn]
+            # Run command
+            run_cmd('image_mosaic', merge_args)
+        else:
+            print('4-band mosaic already exists, skipping gdal_merge.')
+    elif os.path.isfile(multispec_dir):
+        multispec_mosaic_fn = multispec_dir
+    
+    # Construct stable surfaces mask
+    trees_mask_fn, snow_mask_fn, ss_mask_fn = construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold, ndsi_threshold, plot_results=True)
+
+    # Trim DEMs to SkySat footprint + 1km buffer to speed up computations
+    def trim_dem(dem_fn, bound_fn, out_dir):
+        # copy DEM to output directory
+        shutil.copy2(dem_fn, out_dir)
+        dem_fn = os.path.join(out_dir, os.path.basename(dem_fn))
+        # Trim DEM to SkySat footprint + 1 km buffer
+        dem_trim_fn = os.path.join(out_dir, os.path.splitext(os.path.basename(dem_fn))[0] + '_shpclip_trim.tif')
+        if not os.path.exists(dem_trim_fn):
+            print("Cropping reference DEM to extent of SkySat footprint + 1 km buffer")
+            misc.clip_raster_by_shp_disk(dem_fn, bound_fn)
+            misc.ndvtrim_function(os.path.splitext(dem_fn)[0] + '_shpclip.tif')
+            # Use the median DEM value where there's no coverage in the images footprint
+            # dem_trim = rxr.open_rasterio(dem_trim_fn).squeeze()
+            # crs = dem_trim.rio.crs
+            # dem_trim = xr.where(dem_trim <= 0, np.nan, dem_trim)
+            # dem_trim_median = np.nanmedian(dem_trim.data)
+            # dem_trim = xr.where(np.isnan(dem_trim), dem_trim_median, dem_trim)
+            # dem_trim = dem_trim.rio.write_crs(crs)
+            # dem_trim.rio.to_raster(dem_trim_fn)
+        return dem_trim_fn
+    
+    coreg_dem_fn = trim_dem(coreg_dem_fn, bound_buffer_fn, out_dir)
+    if coreg_dem_fn != ortho_dem_fn:
+        ortho_dem_fn = trim_dem(ortho_dem_fn, bound_buffer_fn, out_dir)
+    
+    # Mask coreg DEM to stable surfaces
+    if coreg_stable_only:
+        def mask_coreg_dem(dem_fn, ss_mask_fn, out_dir):
+            dem_stable_fn = os.path.join(out_dir, os.path.splitext(os.path.basename(dem_fn))[0] + '_stable.tif')
+            if not os.path.exists(dem_stable_fn):
+                print("Masking coreg DEM to stable surfaces")
+                dem = rxr.open_rasterio(dem_fn).squeeze()
+                ss_mask = rxr.open_rasterio(ss_mask_fn).squeeze().rio.reproject_match(dem)
+                dem_masked = xr.where(ss_mask==1, dem, np.nan)
+                dem_masked.rio.write_crs(dem.rio.crs, inplace=True)
+                dem_masked.rio.to_raster(dem_stable_fn, dtype='float32', nodata=np.nan)
+                print('Stable surfaces DEM saved to file:', dem_stable_fn)
+            return dem_stable_fn
+        coreg_dem_fn = mask_coreg_dem(coreg_dem_fn, ss_mask_fn, out_dir)
+    
+    return coreg_dem_fn, ortho_dem_fn, epsg_code
+    
+# def prepare_reference_elevations(coreg_dem_fn, ortho_dem_fn, multispec_dir, bound_fn, bound_buffer_fn, out_dir, 
+#                                  ndvi_threshold=0.5, ndsi_threshold=0.4, coreg_stable_only=False):
+#     # Check if output directory exists
+#     if not os.path.exists(out_dir):
+#         os.mkdir(out_dir)
+
+#     # Determine optimal UTM zone and clipping bounds
+#     print("Computing Target UTM zones for orthorectification")
+#     gdf = gpd.read_file(bound_fn)
+#     clon, clat = [gdf.centroid.x.values, gdf.centroid.y.values]
+#     epsg_code = f'EPSG:{geo.compute_epsg(clon, clat)}'
+#     print(f"Detected UTM zone is {epsg_code}")
+#     if not os.path.exists(bound_buffer_fn):
+#         print("Creating buffered shapefile")
+#         gdf_proj = gdf.to_crs(epsg_code)
+#         gdf_proj['geometry'] = gdf_proj.buffer(1000)
+#         gdf_proj.to_file(bound_buffer_fn, driver='GPKG')
+    
+#     # Check if multispec_dir is a directory of images or a single file
+#     if os.path.isdir(multispec_dir):
+#         multispec_mosaic_fn = os.path.join(out_dir, '4band_mosaic.tif')
+#         # Check if mosaic exists
+#         if not os.path.exists(multispec_mosaic_fn):
+#             print('Mosacking 4-band SR images...')
+#             # Grab all 4-band SR image file names
+#             multispec_fns = sorted(glob.glob(os.path.join(multispec_dir, '*_SR.tif')))
+#             # Construct gdal_merge arguments
+#             merge_args = multispec_fns + ['--ot', 'Int16', '--no-bigtiff', '-o', multispec_mosaic_fn]
+#             # Run command
+#             run_cmd('image_mosaic', merge_args)
+#         else:
+#             print('4-band mosaic already exists, skipping gdal_merge.')
+#     elif os.path.isfile(multispec_dir):
+#         multispec_mosaic_fn = multispec_dir
+    
+#     # Construct stable surfaces mask
+#     trees_mask_fn, snow_mask_fn, ss_mask_fn = construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold, ndsi_threshold, plot_results=True)
+
+#     # Trim DEMs to SkySat footprint + 1km buffer to speed up computations
+#     def trim_dem(dem_fn, bound_fn, out_dir):
+#         # copy DEM to output directory
+#         shutil.copy2(dem_fn, out_dir)
+#         dem_fn = os.path.join(out_dir, os.path.basename(dem_fn))
+#         # Trim DEM to SkySat footprint + 1 km buffer
+#         dem_trim_fn = os.path.join(out_dir, os.path.splitext(os.path.basename(dem_fn))[0] + '_shpclip_trim.tif')
+#         if not os.path.exists(dem_trim_fn):
+#             print("Cropping reference DEM to extent of SkySat footprint + 1 km buffer")
+#             misc.clip_raster_by_shp_disk(dem_fn, bound_fn)
+#             misc.ndvtrim_function(os.path.splitext(dem_fn)[0] + '_shpclip.tif')
+#             # Use the median DEM value where there's no coverage in the images footprint
+#             dem_trim = rxr.open_rasterio(dem_trim_fn).squeeze()
+#             crs = dem_trim.rio.crs
+#             dem_trim = xr.where(dem_trim <= 0, np.nan, dem_trim)
+#             dem_trim_median = np.nanmedian(dem_trim.data)
+#             dem_trim = xr.where(np.isnan(dem_trim), dem_trim_median, dem_trim)
+#             dem_trim = dem_trim.rio.write_crs(crs)
+#             dem_trim.rio.to_raster(dem_trim_fn)
+#         return dem_trim_fn
+    
+#     coreg_dem_fn = trim_dem(coreg_dem_fn, bound_buffer_fn, out_dir)
+#     if coreg_dem_fn != ortho_dem_fn:
+#         ortho_dem_fn = trim_dem(ortho_dem_fn, bound_buffer_fn, out_dir)
+    
+#     # Mask coreg DEM to stable surfaces
+#     if coreg_stable_only:
+#         def mask_coreg_dem(dem_fn, ss_mask_fn, out_dir):
+#             dem_stable_fn = os.path.join(out_dir, os.path.splitext(os.path.basename(dem_fn))[0] + '_stable.tif')
+#             if not os.path.exists(dem_stable_fn):
+#                 print("Masking coreg DEM to stable surfaces")
+#                 dem = rxr.open_rasterio(dem_fn).squeeze()
+#                 ss_mask = rxr.open_rasterio(ss_mask_fn).squeeze().rio.reproject_match(dem)
+#                 dem_masked = xr.where(ss_mask==1, dem, np.nan)
+#                 dem_masked.rio.write_crs(dem.rio.crs, inplace=True)
+#                 dem_masked.rio.to_raster(dem_stable_fn, dtype='float32', nodata=np.nan)
+#                 print('Stable surfaces DEM saved to file:', dem_stable_fn)
+#             return dem_stable_fn
+#         coreg_dem_fn = mask_coreg_dem(coreg_dem_fn, ss_mask_fn, out_dir)
+    
+#     return coreg_dem_fn, ortho_dem_fn, epsg_code
+    
+def execute_skysat_orthorectification(images,outdir,data='triplet',dem='WGS84',tr=None,tsrs=None,del_opt=False,cam_folder=None,ba_prefix=None,
     mode='science',session=None,overlap_list=None,frame_index_fn=None,copy_rpc=1,orthomosaic=0):
     """
     """
-    from p_tqdm import p_map
     if mode == 'browse':
         """
         this block creates low-res orthomosaics from RPC info for browsing purpose only
@@ -317,9 +536,9 @@ def execute_skysat_orhtorectification(images,outdir,data='triplet',dem='WGS84',t
         #Save figure to jpeg ?
         fig_title = os.path.basename(images[0]).split('_',15)[0]+'_'+for_time+'_'+nadir_time+'_'+aft_time
         fig,ax = plt.subplots(1,3,figsize=(10,10))
-        pltlib.iv_fn(for_out_mos,full=True,ax=ax[0],cmap='gray',scalebar=True,title='Forward')
-        pltlib.iv_fn(nadir_out_mos,full=True,ax=ax[1],cmap='gray',scalebar=True,title='NADIR')
-        pltlib.iv_fn(aft_out_mos,full=True,ax=ax[2],cmap='gray',scalebar=True,title='Aft')
+        # pltlib.iv_fn(for_out_mos,full=True,ax=ax[0],cmap='gray',scalebar=True,title='Forward')
+        # pltlib.iv_fn(nadir_out_mos,full=True,ax=ax[1],cmap='gray',scalebar=True,title='NADIR')
+        # pltlib.iv_fn(aft_out_mos,full=True,ax=ax[2],cmap='gray',scalebar=True,title='Aft')
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         fig.suptitle(fig_title)
         browse_img_fn = os.path.join(outdir,'browse_img_{}_{}m.jpg'.format(fig_title,tr))
@@ -340,19 +559,25 @@ def execute_skysat_orhtorectification(images,outdir,data='triplet',dem='WGS84',t
             total_img = l_img + r_img
             uniq_idx = np.unique(total_img, return_index=True)[1]
             img_list = [total_img[idx] for idx in sorted(uniq_idx)]
-
+            # Filter to images with cameras
+            if ba_prefix is not None:
+                img_list_new = []
+                for img_fn in img_list:
+                    cam_fn = glob.glob(os.path.abspath(ba_prefix)+'-'+os.path.splitext(os.path.basename(img_fn))[0]+'*.tsai')
+                    if len(cam_fn) > 0:
+                        img_list_new.append(img_fn)
+                img_list = img_list_new
             print(f"Out of the initial {initial_count} images, {len(img_list)} will be orthorectified using adjusted cameras")
-
 
         if frame_index_fn is not None:
             frame_index = skysat.parse_frame_index(frame_index_fn)
-            dir = images
             img_list = [glob.glob(os.path.join(dir,'{}*.tiff'.format(frame)))[0] for frame in frame_index.name.values]
             print("no of images is {}".format(len(img_list)))
         img_prefix = [os.path.splitext(os.path.basename(img))[0] for img in img_list]
         out_list = [os.path.join(outdir,img+'_map.tif') for img in img_prefix]
         session_list = [session]*len(img_list)
         dem_list = [dem]*len(img_list)
+        # dem_list = ['WGS84']*len(img_list)
         tr_list = [tr]*len(img_list)
         if frame_index_fn is not None:
             # this hack is for video
@@ -384,11 +609,15 @@ def execute_skysat_orhtorectification(images,outdir,data='triplet',dem='WGS84',t
                 f.write(log)
         if copy_rpc == 1:
             print("Copying RPC from native image to orthoimage in parallel")
-            copy_rpc_out = p_map(skysat.copy_rpc,img_list,out_list,num_cpus=iolib.cpu_count())
+            try:
+                copy_rpc_out = p_map(skysat.copy_rpc,img_list,out_list,num_cpus=iolib.cpu_count())
+            except Exception as e:
+                print(e)
         if orthomosaic == 1:
             print("Will also produce median, weighted average and highest resolution orthomosaic")
             if data == 'triplet':
                 # sort images based on timestamps and resolutions
+                out_list = glob.glob(os.path.join(outdir, '*_map.tif'))
                 img_list, time_list = skysat.sort_img_list(out_list)
                 res_sorted_list = skysat.res_sort(out_list)
 
@@ -444,7 +673,6 @@ def execute_skysat_stereo(img,outfol,mode,session='rpc',dem=None,texture='high',
     full_extent=1,entry_point='pprc',threads=2,overlap_pkl=None,frame_index=None,job_fn=None,cross_track=False):
     """
     """
-    from p_tqdm import p_map
     img = os.path.abspath(img)
     try:
         img_list = sorted(glob.glob(os.path.join(img, '*.tif')))
@@ -485,6 +713,7 @@ def execute_skysat_stereo(img,outfol,mode,session='rpc',dem=None,texture='high',
             threads = threads,overlap_list=overlap_pkl, img_list=img_list, ba_prefix=ba_prefix, 
             cam_fol=cam_folder, dem=dem, crop_map=crop_map,texture=texture, outfol=outfol, block=block,
             entry_point=entry_point)
+        print(job_list[0])
     if not writeout_only:
         # decide on number of processes
         # if block matching, Plieades is able to handle 30-40 4 threaded jobs on bro node
@@ -497,12 +726,13 @@ def execute_skysat_stereo(img,outfol,mode,session='rpc',dem=None,texture='high',
         #jobs = int(n_cpu/threads)
         # this seems to break with new paralle_stereo setup
         # setting hardcoded value of 20 for now
-        jobs = 20
-        stereo_log = p_map(asp.run_cmd,['parallel_stereo']*len(job_list), job_list, num_cpus=jobs)
-        stereo_log_fn = os.path.join(outfol,'stereo_log.log')
+        # jobs = 20
+        stereo_log = p_map(asp.run_cmd,['parallel_stereo']*len(job_list), job_list, num_cpus=n_cpu)
+        print(stereo_log)
+        stereo_log_fn = os.path.join(outfol,'stereo_log.log')      
         print("Consolidated stereo log saved at {}".format(stereo_log_fn))
     else:
-        print(f"Writng jobs at {job_fn}")
+        print(f"Writing jobs at {job_fn}")
         with open(job_fn,'w') as f:
             for idx,job in enumerate(tqdm(job_list)):
                 try:                
@@ -511,9 +741,245 @@ def execute_skysat_stereo(img,outfol,mode,session='rpc',dem=None,texture='high',
                 except:
                     continue
 
-                    
+
+def add_cam_intrinsics(input_file, output_file, distortion_model='TSAI',
+                       intrinsics={'k1': -1e-12, 'k2': -1e-12, 'k3': -1e-12, 'p1': -1e-12, 'p2': -1e-12}):
+    # Read the .tsai file
+    with open(input_file, 'r') as file:
+        lines = file.readlines()
+    updated_lines = lines
+    # Remove NULL line
+    updated_lines = [line for line in updated_lines if line!='NULL\n']
+    # Add the distortion model
+    if f"{distortion_model}\n" not in updated_lines:
+        updated_lines.append(f"{distortion_model}\n")
+    # Add distortion parameters
+    for key in intrinsics.keys():
+        addition = f"{key} = {intrinsics[key]:.8f}\n"
+        if addition not in updated_lines:
+            updated_lines.append(addition)
+    # Save the updated file
+    with open(output_file, 'w') as file:
+        file.writelines(updated_lines)
+    # print('Saved updated camera file:', output_file)
+
+
+def bundle_adjustment(img_folder, ba_prefix, cam, overlap_list=None, 
+                      dem=None, dem_in_ba=False, dem_uncertainty=10, num_iter=1000, num_pass=2):
+    # Create output directory
+    out_dir = os.path.dirname(ba_prefix)
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+    
+    # Grab list of images
+    img_list = sorted(glob.glob(os.path.join(img_folder,'*.tif')) + glob.glob(os.path.join(img_folder, '*.tiff')))
+    if len(img_list) < 2:
+        if os.path.islink(img_list[0]):
+            img_list = [os.readlink(x) for x in img_list] 
+    
+    # Filter to images with cameras (in case any failed in previous step)
+    cam_list = sorted(glob.glob(os.path.join(cam, '*.tsai')))
+    img_list_new = [os.path.join(img_folder, os.path.basename(cam_fn).replace('_rpc.tsai', '.tif')) for cam_fn in cam_list]
+    print(f"Out of the initial {len(img_list)} images, {len(img_list_new)} will be orthorectified using adjusted cameras")
+    img_list = img_list_new
+    # Check if there are enough images
+    if len(img_list) < 2:
+        raise Exception('Not enough images with cameras found')
+    
+    ## ROUND 1: fix first 3 cameras
+    # the concept is simple: first 3 cameras, and then corresponding first three cameras from next collection are fixed in the first go.
+    # these serve as a kind of #GCP, preventing a large drift in the triangulated points/camera extrinsics during optimization
+    img_time_identifier_list = np.array([os.path.basename(img).split('_')[1] for img in img_list])
+    img_time_unique_list = np.unique(img_time_identifier_list)
+    second_collection_list = np.where(img_time_identifier_list == img_time_unique_list[1])[0][[0,1,2]]
+    fix_cam_idx = np.array([0,1,2]+list(second_collection_list))    
+    fix_cam_idx_str = ' '.join(fix_cam_idx.astype(str))
+    # Define bundle adjustment arguments
+    ba_args = ['--fixed-camera-indices', fix_cam_idx_str,
+               '--overlap-list', overlap_list,
+               '--threads', str(iolib.cpu_count()),
+               '--num-iterations', str(num_iter),
+               '--num-passes', str(num_pass),
+               '--camera-position-weight', '0',
+               '--remove-outliers-params', "75 3 20 20",
+               '--min-matches', '4',
+               '--ip-per-tile', '4000',
+               '--ip-inlier-factor', '0.2',
+               '--individually-normalize',
+               '--inline-adjustments',
+               '--min-triangulation-angle', '0.0001',
+               '--save-cnet-as-csv',
+               '-o', ba_prefix] 
+    if dem_in_ba:
+        ba_args.extend(['--heights-from-dem', dem,
+                        '--heights-from-dem-uncertainty', str(dem_uncertainty)])
+    ba_args += img_list + cam_list
+    print('ROUND 1')
+    # print(ba_args)
+    run_cmd('bundle_adjust', ba_args)
+    
+    ### ROUND 2: refine with DEM, (optional) solve intrinsics
+    identifier = os.path.basename(cam_list[0]).split('_',14)[0][:2]
+    print(ba_prefix+'-{}*.tsai'.format(identifier))
+    cam_list = sorted(glob.glob(os.path.join(ba_prefix+ '-{}*.tsai'.format(identifier))))
+    fix_cam_idx2 = np.delete(np.arange(len(img_list),dtype=int),fix_cam_idx)
+    fix_cam_idx2_str = ' '.join(fix_cam_idx2.astype(str))
+    # Define bundle adjustment arguments
+    ba_args = ['--fixed-camera-indices', fix_cam_idx2_str,
+               '--force-reuse-match-files',
+               '--overlap-list', overlap_list,
+               '--threads', str(iolib.cpu_count()),
+               '--num-iterations', str(num_iter),
+               '--num-passes', str(num_pass),
+               '--camera-position-weight', '0',
+               '--remove-outliers-params', "75 3 20 20",
+               '--min-matches', '4',
+               '--ip-per-tile', '4000',
+               '--ip-inlier-factor', '0.2',
+               '--individually-normalize',
+               '--inline-adjustments',
+               '--min-triangulation-angle', '0.0001',
+               '--save-cnet-as-csv',
+               '-o', ba_prefix]
+    if dem_in_ba:
+        ba_args.extend(['--heights-from-dem', dem,
+                        '--heights-from-dem-uncertainty', str(dem_uncertainty)])
+    ba_args += img_list + cam_list
+    print('ROUND 2')
+    # print(ba_args)
+    run_cmd('bundle_adjust', ba_args)
+
+
+# def bundle_adjustment(img_folder, ba_prefix, cam, overlap_list=None, 
+#                       dem=None, num_iter=1000, num_pass=2, float_intrinsics=True):
+#     # Create output directory
+#     out_dir = os.path.dirname(ba_prefix)
+#     if not os.path.exists(out_dir):
+#         os.mkdir(out_dir)
+    
+#     # Grab list of images
+#     img_list = sorted(glob.glob(os.path.join(img_folder,'*.tif')) + glob.glob(os.path.join(img_folder, '*.tiff')))
+#     if len(img_list) < 2:
+#         if os.path.islink(img_list[0]):
+#             img_list = [os.readlink(x) for x in img_list] 
+    
+#     # Filter to images with cameras (some may have failed in previous step)
+#     cam_list = sorted(glob.glob(os.path.join(cam, '*.tsai')))
+#     img_list_new = [os.path.join(img_folder, os.path.basename(cam_fn).replace('_rpc.tsai', '.tif')) for cam_fn in cam_list]
+#     print(f"Out of the initial {len(img_list)} images, {len(img_list_new)} will be orthorectified using adjusted cameras")
+#     img_list = img_list_new
+#     # Check if there are enough images
+#     if len(img_list) < 2:
+#         raise Exception('Not enough images with cameras found')
+    
+#     ## ROUND 1: Solve extrinsics, fixed intrinsics
+#     # Sort image and camera lists by camera number to align with order in txt files later
+#     img_list.sort(key=lambda x: os.path.basename(x).split('_')[2])
+#     cam_list.sort(key=lambda x: os.path.basename(x).split('_')[2])
+#     # Write images file names to txt file
+#     img_txt_fn1 = os.path.join(out_dir, f'round1_images.txt')
+#     with open(img_txt_fn1, 'w') as file:
+#         for image_fn in img_list:
+#             file.write(f'{image_fn}\n')
+#     # Write camera file names to text file
+#     cam_txt_fn1 = os.path.join(out_dir, f'round1_cameras.txt')
+#     with open(cam_txt_fn1, 'w') as file:
+#         for cam_fn in cam_list:
+#             file.write(f'{cam_fn}\n')
+        
+#     # Define bundle adjustment arguments
+#     ba_args = ['--image-list', img_txt_fn1,
+#                '--camera-list', cam_txt_fn1,
+#                '--overlap-list', overlap_list,
+#                '--threads', str(iolib.cpu_count()),
+#                '--num-iterations', str(num_iter),
+#                '--num-passes', str(num_pass),
+#                '--camera-position-weight', '0',
+#                '--remove-outliers-params', "75 3 20 20",
+#                '--min-matches', '4',
+#                '--ip-per-tile', '2000',
+#                '--individually-normalize',
+#                '--inline-adjustments',
+#                '--min-triangulation-angle', '0.0001',
+#                '--save-cnet-as-csv',
+#                '-o', ba_prefix]
+#     # print(ba_args)
+#     print("Running bundle adjustment round 1")
+#     run_cmd('bundle_adjust', ba_args)
+    
+#     ### ROUND 2: refine with DEM, (optional) solve intrinsics
+#     if float_intrinsics:
+#         # Split cameras into individual files
+#         def extract_unique_cam_strings(file_list):
+#             ssc_pattern = re.compile(r'ssc\d+d\d+')
+#             unique_ssc_strings = set()
+#             for file_name in file_list:
+#                 match = ssc_pattern.search(file_name)
+#                 if match:
+#                     unique_ssc_strings.add(match.group())
+#             return list(unique_ssc_strings)
+#         cam_strings = extract_unique_cam_strings(cam_list)
+#         print('Number of unique cameras:', len(cam_strings))
+    
+#         # Add initial intrinsics to cameras
+#         print('Adding initial intrinsics parameters to camera files')
+#         cam_list_out = [os.path.join(out_dir, os.path.basename(cam_fn)) for cam_fn in cam_list]
+#         p_map(add_cam_intrinsics, cam_list, cam_list_out, num_cpus=iolib.cpu_count())
+    
+#         # Write separate text files for each camera
+#         for cam_string in cam_strings:
+#             cam_fns_string = [cam_fn for cam_fn in cam_list_out if cam_string in cam_fn]
+#             img_fns = [os.path.join(img_folder, os.path.basename(cam_fn).replace('_rpc.tsai', '.tif')) 
+#                     for cam_fn in cam_fns_string]
+#             # Write image file names to text file
+#             with open(os.path.join(out_dir, f'round2_{cam_string}_images.txt'), 'w') as file:
+#                 for image_fn in img_fns:
+#                     file.write(f'{image_fn}\n')
+#             # Write camera file names to text file
+#             with open(os.path.join(out_dir, f'round2_{cam_string}_cameras.txt'), 'w') as file:
+#                 for cam_fn in cam_fns_string:
+#                     file.write(f'{cam_fn}\n') 
+#         img_txt_fns = sorted(glob.glob(os.path.join(out_dir, 'round2*images.txt')))
+#         cam_txt_fns = sorted(glob.glob(os.path.join(out_dir, 'round2*cameras.txt')))
+#         img_txt_fn2 = ','.join(img_txt_fns)
+#         cam_txt_fn2 = ','.join(cam_txt_fns)
+#         cam_wt = '100'
+    
+#     else:
+#         img_txt_fn2 = img_txt_fn1
+#         cam_txt_fn2 = cam_txt_fn1
+#         cam_wt = '0'
+        
+#     # Define bundle adjustment arguments
+#     ba_args = ['--image-list', img_txt_fn2,
+#                '--camera-list', cam_txt_fn2,
+#                '--overlap-list', overlap_list,
+#                '--heights-from-dem', dem,
+#                '--heights-from-dem-uncertainty', '6',
+#                '--force-reuse-match-files',
+#                '--match-files-prefix', ba_prefix,
+#                '--threads', str(iolib.cpu_count()),
+#                '--num-iterations', str(num_iter),
+#                '--num-passes', str(num_pass),
+#                '--camera-position-weight', cam_wt,
+#                '--remove-outliers-params', "75 3 20 20",
+#                '--min-matches', '4',
+#                '--ip-per-tile', '4000',
+#                '--individually-normalize',
+#                '--inline-adjustments',
+#                '--min-triangulation-angle', '0.0001',
+#                '--save-cnet-as-csv',
+#                '-o', ba_prefix + '-run']
+
+#     if float_intrinsics:
+#         ba_args.extend(['--solve-intrinsics',
+#                         '--intrinsics-to-float', "optical_center,focal_length,other_intrinsics"])
+#     # print(ba_args)
+#     print('Running bundle adjustment round 2')
+#     run_cmd('bundle_adjust', ba_args)
+
+
 def gridding_wrapper(pc_list,tr,tsrs=None):
-    from p_tqdm import p_map
     if tsrs is None:
         print("Projected Target CRS not provided, reading from the first point cloud")
         
@@ -522,7 +988,7 @@ def gridding_wrapper(pc_list,tr,tsrs=None):
         pc_center = os.path.splitext(pc_list[0])[0]+'-center.txt'
         with open(pc_center,'r') as f:
             content = f.readlines()
-        X,Y,Z = [np.float(x) for x in content[0].split(' ')[:-1]]
+        X,Y,Z = [float(x) for x in content[0].split(' ')[:-1]]
         ecef_proj = 'EPSG:4978'
         geo_proj = 'EPSG:4326'
         ecef2wgs = Transformer.from_crs(ecef_proj,geo_proj)
@@ -535,11 +1001,6 @@ def gridding_wrapper(pc_list,tr,tsrs=None):
     job_list = [point2dem_opts + [pc] for pc in pc_list]
     p2dem_log = p_map(asp.run_cmd,['point2dem'] * len(job_list), job_list, num_cpus = n_cpu)
     print(p2dem_log)
-
-def dem_mosaic_holefill_wrapper(input_dem_list,output_dem_path):
-    mos_cmd = ['--dem-blur-sigma','9','--median','-o', output_dem_path]
-    asp.run_cmd('dem_mosaic', mos_cmd+input_dem_list)
-
     
     
 def alignment_wrapper_single(ref_dem,source_dem,max_displacement,outprefix,
@@ -548,12 +1009,11 @@ def alignment_wrapper_single(ref_dem,source_dem,max_displacement,outprefix,
         trans_only = False
     else:
         trans_only = True
-    asp.dem_align(ref_dem,source_dem,max_displacement,outprefix,align,
-                  trans_only,threads=iolib.cpu_count(),initial_align=initial_align)
+    asp.dem_align(ref_dem, source_dem, max_displacement, outprefix, align,
+                  trans_only, threads=iolib.cpu_count(), initial_align=initial_align)
     
 def alignment_wrapper_multi(ref_dem,source_dem_list,max_displacement,align='point-to-plane',initial_align=None,
                             trans_only=0):
-    from p_tqdm import p_umap
     outprefix_list=['{}_aligned_to{}'.format(os.path.splitext(source_dem)[0],os.path.splitext(os.path.basename(ref_dem))[0]) for source_dem in source_dem_list]
     if trans_only == 0:
         trans_only = False
@@ -570,7 +1030,6 @@ def alignment_wrapper_multi(ref_dem,source_dem_list,max_displacement,align='poin
            align_list,trans_list,[1]*n_source,initial_align,num_cpus = iolib.cpu_count())
     
 def align_cameras_wrapper(input_camera_list,transform_txt,outfolder,rpc=0,dem='None',img_list=None):
-    from p_tqdm import p_umap
     n_cam=len(input_camera_list)
     if (rpc == 1) & (dem != 'None'):
         print("Will also write RPC files")
@@ -589,8 +1048,85 @@ def align_cameras_wrapper(input_camera_list,transform_txt,outfolder,rpc=0,dem='N
            img_list,num_cpus = iolib.cpu_count())
     
 
+def plot_composite_fig(ortho_fn, georegistered_median_dem_fn, count_fn, nmad_fn, outfn=None):
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
+    import rasterio as rio
+    from matplotlib import colors
+    import numpy as np
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    # Read files
+    def read_data(raster):
+        data = raster.read(1)
+        data = np.ma.masked_where(data == raster.nodata, data)
+        return data
+    ortho = rio.open(ortho_fn)
+    ortho_data = read_data(ortho)
+    dem = rio.open(georegistered_median_dem_fn)
+    dem_data = read_data(dem)
+    count = rio.open(count_fn)
+    count_data = read_data(count)
+    nmad = rio.open(nmad_fn)
+    nmad_data = read_data(nmad)
+
+    def remove_ticks(axes):
+        axes.set_xticks([])
+        axes.set_yticks([])
+
+    def add_colorbar(image, axes):
+        x0, width = axes.get_position().x0, axes.get_position().width
+        cax = fig.add_axes([x0, 0.1, width, 0.03])
+        cbar = plt.colorbar(image, cax=cax, orientation='horizontal')
+        return cbar
+
+    # Plot
+    plt.rcParams.update({'font.size': 12})
+    fig, ax = plt.subplots(1, 4, figsize=(20, 5))
+    fig.subplots_adjust(bottom=0.15)
+    # Orthoimage
+    ax[0].imshow(ortho_data, cmap='Greys_r',
+                extent=(ortho.bounds.left/1e3, ortho.bounds.right/1e3, ortho.bounds.bottom/1e3, ortho.bounds.top/1e3))
+    ax[0].set_title('Orthoimage')
+    remove_ticks(ax[0])
+    # Add scale bar
+    scalebar = AnchoredSizeBar(ax[0].transData,
+                            1, '1 km', 'lower right', 
+                            pad=0.3,
+                            color='black',
+                            frameon=False,
+                            size_vertical=0.01)
+    ax[0].add_artist(scalebar)
+    # Shaded relief
+    ls = colors.LightSource(azdeg=315, altdeg=45)
+    hs = ls.hillshade(dem_data, vert_exag=5)
+    ax[1].imshow(hs, cmap='Greys_r',
+                extent=(dem.bounds.left/1e3, dem.bounds.right/1e3, dem.bounds.bottom/1e3, dem.bounds.top/1e3))
+    im = ax[1].imshow(dem_data, cmap='terrain', alpha=0.7, 
+                    extent=(dem.bounds.left/1e3, dem.bounds.right/1e3, dem.bounds.bottom/1e3, dem.bounds.top/1e3))
+    remove_ticks(ax[1])
+    add_colorbar(im, ax[1])
+    ax[1].set_title('DEM')
+    # Count map
+    im = ax[2].imshow(count_data, cmap='viridis', #clim=(0,np.nanpercentile(count_data, 95)),
+                    extent=(count.bounds.left/1e3, count.bounds.right/1e3, count.bounds.bottom/1e3, count.bounds.top/1e3))
+    remove_ticks(ax[2])
+    add_colorbar(im, ax[2])
+    ax[2].set_title('DEM counts')
+    # NMAD
+    # cmap = colors.LinearSegmentedColormap.from_list('custom', ['w', '#67000d'])
+    im = ax[3].imshow(nmad_data, cmap='Reds', #clim=(0, np.nanpercentile(nmad_data, 95)),
+                extent=(nmad.bounds.left/1e3, nmad.bounds.right/1e3, nmad.bounds.bottom/1e3, nmad.bounds.top/1e3))
+    remove_ticks(ax[3])
+    add_colorbar(im, ax[3])
+    ax[3].set_title('NMAD')
+
+    fig.savefig(outfn, dpi=300, bbox_inches='tight')
+    print('Final figure saved to file:', outfn)
+    plt.close()
+
+    
 def dem_mosaic_wrapper(dir,mode='triplet',out_folder=None,identifier=None,tile_size=None,filter_dem=1,min_video_count=2,max_video_nmad=5):
-    from p_tqdm import p_map
     if out_folder is None:
         out_folder = os.path.join(dir,'composite_dems')
     
@@ -641,9 +1177,11 @@ def dem_mosaic_wrapper(dir,mode='triplet',out_folder=None,identifier=None,tile_s
             t2.append(d)
         if len(direc)>3:
             composite_prefix = 'multiview_'+'_'.join(np.unique(mdt1+mdt2))+'__'+'_'.join(np.unique(t1+t2))
+        elif len(direc) < 1:
+            composite_prefix = 'stereo_'+'_'.join(np.unique(mdt1+mdt2))+'__'+'_'.join(np.unique(t1+t2))
         else:
             composite_prefix = 'triplet_'+'_'.join(np.unique(mdt1+mdt2))+'__'+'_'.join(np.unique(t1+t2))
-            
+
         # produce bistereo pairwise mosaics
         len_combinations = len(combination_out_list)
         
@@ -656,7 +1194,7 @@ def dem_mosaic_wrapper(dir,mode='triplet',out_folder=None,identifier=None,tile_s
                 ['None']*len_combinations,[None]*len_combinations,
                 [None]*len_combinations,[tile_size]*len_combinations)
 
-        if len_combinations > 2:
+        if len_combinations >= 1:
             print("Producing triplet/multiview composites")
             total_dem_list = list(itertools.chain.from_iterable(valid_dem_dir_list))
             print(f"Mosaicing {len(total_dem_list)} DEM strips using median, wt_avg, count, nmad operators")
@@ -664,7 +1202,7 @@ def dem_mosaic_wrapper(dir,mode='triplet',out_folder=None,identifier=None,tile_s
             out_fn_list = [os.path.join(out_folder,
                             '{}_{}_mos.tif'.format(composite_prefix,stat)) for stat in ['wt_avg','median','nmad','count']]
             composite_mos_log = p_map(asp.dem_mosaic,[total_dem_list]*4,out_fn_list,['None']*4,[None]*4,stats_list,
-                                [tile_size]*4,num_cpus=4)
+                                [tile_size]*4,num_cpus=4)            
         out_log_fn = os.path.join(out_folder,'skysat_triplet_dem_mos.log')
         print("Saving triplet DEM mosaic log at {}".format(out_log_fn))
         with open(out_log_fn,'w') as f:

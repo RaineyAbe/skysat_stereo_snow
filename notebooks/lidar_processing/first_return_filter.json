@@ -1,1 +1,0 @@
-{"pipeline": [{"type": "readers.las","default_srs": "EPSG:26910"}, {"type": "filters.returns", "groups": "first,only"}, {"type": "writers.las", "compression": "true", "forward": "all"}]}

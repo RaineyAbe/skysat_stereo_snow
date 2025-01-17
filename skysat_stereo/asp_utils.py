@@ -29,23 +29,18 @@ def run_cmd(bin, args, **kw):
         log (stdout) as str if the command executed, error message if the command failed
     """
     #Note, need to add full executable
-    #from dshean/vmap.py
-    #binpath = os.path.join('/home/sbhushan/src/StereoPipeline/bin',bin)
+    # binpath = shutil.which(bin)
+    # binpath = '/Users/raineyaberle/Research/PhD/SnowDEMs/StereoPipeline-3.5.0-alpha-2024-10-05-x86_64-OSX/bin/' + bin
     binpath = find_executable(bin)
-    #if binpath is None:
-        #msg = ("Unable to find executable %s\n"
-        #"Install ASP and ensure it is in your PATH env variable\n"
-       #"https://ti.arc.nasa.gov/tech/asr/intelligent-robotics/ngt/stereo/" % bin)
-        #sys.exit(msg)
-    #binpath = os.path.join('/opt/StereoPipeline/bin/',bin)
+    # print(binpath)
+    if binpath is None:
+        msg = ("Unable to find executable %s\n"
+        "Install ASP and ensure it is in your PATH env variable\n"
+       "https://ti.arc.nasa.gov/tech/asr/intelligent-robotics/ngt/stereo/" % bin)
+        sys.exit(msg)
     call = [binpath,]
-    #print(call)
-    
-    #print(call)
-    #print(' '.join(call))
     if args is not None: 
         call.extend(args)
-    #print(call)
     try:
         out = subprocess.run(call,check=True,capture_output=True,encoding='UTF-8').stdout
     except:
@@ -71,15 +66,15 @@ def read_tsai_dict(tsai):
     with open(tsai,'r') as f:
         content = f.readlines()
     content = [x.strip() for x in content]
-    fu = np.float(content[2].split(' = ',4)[1]) # focal length in x
-    fv = np.float(content[3].split(' = ',4)[1]) # focal length in y
-    cu = np.float(content[4].split(' = ',4)[1]) # optical center in x
-    cv = np.float(content[5].split(' = ',4)[1]) # optical center in y
+    fu = float(content[2].split(' = ',4)[1]) # focal length in x
+    fv = float(content[3].split(' = ',4)[1]) # focal length in y
+    cu = float(content[4].split(' = ',4)[1]) # optical center in x
+    cv = float(content[5].split(' = ',4)[1]) # optical center in y
     cam = content[9].split(' = ',10)[1].split(' ')
-    cam_cen = [np.float(x) for x in cam] # camera center coordinates in ECEF
+    cam_cen = [float(x) for x in cam] # camera center coordinates in ECEF
     rot = content[10].split(' = ',10)[1].split(' ')
-    rot_mat = [np.float(x) for x in rot] # rotation matrix for camera to world coordinates transformation
-    pitch = np.float(content[11].split(' = ',10)[1]) # pixel pitch
+    rot_mat = [float(x) for x in rot] # rotation matrix for camera to world coordinates transformation
+    pitch = float(content[11].split(' = ',10)[1]) # pixel pitch
     
     ecef_proj = 'EPSG:4978'
     geo_proj = 'EPSG:4326'
@@ -115,7 +110,7 @@ def make_tsai(outfn,cu,cv,fu,fv,rot_mat,C,pitch):
     with open(outfn,'w') as f:
         f.write(out_str)
 
-def cam_gen(img,fl=553846.153846,cx=1280,cy=540,pitch=1,ht_datum=None,gcp_std=1,out_fn=None,out_gcp=None,datum='WGS84',refdem=None,camera=None,frame_index=None):
+def cam_gen(img,fl=553846.153846,cx=1280,cy=540,pitch=1,ht_datum=None,gcp_std=1,out_fn=None,out_gcp=None,datum='WGS84',refdem=None,camera=None,frame_index=None,distortion=False):
         """
         function to initiate frame camera models from input rpc model or frame_index (skysat video)
         Theory: Uses camera resection principle to refine camera extrinsic from given ground control point (for rpc cameras as input, also generates initial camera extrinsic, which is then refined from tandard resection principle)
@@ -163,7 +158,8 @@ def cam_gen(img,fl=553846.153846,cx=1280,cy=540,pitch=1,ht_datum=None,gcp_std=1,
             cam_gen_opt.extend(['--height-above-datum',str(ht_datum)])
         cam_gen_opt.extend(['--gcp-std',str(gcp_std)])
         cam_gen_opt.extend(['-o',out_fn])
-        cam_gen_opt.extend(['--gcp-file',out_gcp])
+        if out_gcp is not None:
+            cam_gen_opt.extend(['--gcp-file',out_gcp])
         cam_gen_opt.extend(['--datum',datum])
         cam_gen_opt.extend(['--reference-dem',refdem])
         if camera:
@@ -172,6 +168,8 @@ def cam_gen(img,fl=553846.153846,cx=1280,cy=540,pitch=1,ht_datum=None,gcp_std=1,
             cam_gen_opt.extend(['--frame-index',frame_index])
             cam_gen_opt.extend(['--parse-ecef'])
         cam_gen_opt.extend(['--refine-camera'])
+        if distortion:
+            cam_gen_opt.extent(['--refine-intrinsics','focal_length,distortion'])
         cam_gen_args = [img]
         #print(cam_gen_opt+cam_gen_args)
         out = run_cmd('cam_gen',cam_gen_args+cam_gen_opt,msg='Running camgen command for image {}'.format(os.path.basename(img)))
@@ -340,6 +338,7 @@ def mapproject(img,outfn,session='rpc',dem='WGS84',tr=None,t_srs='EPSG:4326',cam
     map_opt = []
     map_opt.extend(['-t',session])
     map_opt.extend(['--t_srs',t_srs])
+    map_opt.extend(['--threads', str(iolib.cpu_count())])
     if ba_prefix:
         map_opt.extend(['--bundle-adjust-prefix',ba_prefix])
     if extent is not None:
@@ -363,7 +362,7 @@ def mapproject(img,outfn,session='rpc',dem='WGS84',tr=None,t_srs='EPSG:4326',cam
     out = run_cmd('mapproject',map_opt+map_args)
     return out
 
-def dem_mosaic(img_list,outfn,tr=None,tsrs=None,stats=None,tile_size=None,extent=None):
+def dem_mosaic(img_list,outfn,tr=None,tsrs=None,stats=None,tile_size=None):
     """
     mosaic  input image list using ASP's dem_mosaic program.
     See dem_mosaic documentation here: https://stereopipeline.readthedocs.io/en/latest/tools/dem_mosaic.html
@@ -388,6 +387,9 @@ def dem_mosaic(img_list,outfn,tr=None,tsrs=None,stats=None,tile_size=None,extent
     """
 
     dem_mosaic_opt = []
+    
+    # determine number of threads
+    dem_mosaic_opt.extend(['--threads',str(iolib.cpu_count())])
   
     if stats:
         dem_mosaic_opt.extend(['--{}'.format(stats)])
@@ -395,9 +397,6 @@ def dem_mosaic(img_list,outfn,tr=None,tsrs=None,stats=None,tile_size=None,extent
         dem_mosaic_opt.extend(['--tr', str(tr)])
     if tsrs:
         dem_mosaic_opt.extend(['--t_srs', tsrs])
-    if extent:
-        xmin,ymin,xmax,ymax = extent.split(' ')
-        dem_mosaic_opt.extend(['--t_projwin', xmin,ymin,xmax,ymax])
     dem_mosaic_args = img_list
     if tile_size:
         # will first perform tile-wise vertical mosaicing
@@ -511,7 +510,10 @@ def get_stereo_opts(session='rpc',ep=0,threads=4,ba_prefix=None,align='Affineepi
     """
     # stereo_tri_args:
     disp_trip = 10000
-    if not mvs:
+    if session == 'pinholemappinhole':
+        stereo_opt.extend(['--num-matches-from-disparity', str(disp_trip)])
+        stereo_opt.extend(['--unalign-disparity'])
+    elif not mvs:
         stereo_opt.extend(['--num-matches-from-disp-triplets', str(disp_trip)])
         stereo_opt.extend(['--unalign-disparity'])
     return stereo_opt
@@ -619,10 +621,10 @@ def get_total_shift(pc_align_log):
         content = f.readlines()
     substring = 'Maximum displacement of points between the source cloud with any initial transform applied to it and the source cloud after alignment to the reference'
     max_alignment_string = [i for i in content if substring in i]
-    total_shift = np.float(max_alignment_string[0].split(':',15)[-1].split('m')[0])
+    total_shift = float(max_alignment_string[0].split(':',15)[-1].split('m')[0])
     return total_shift
 
-def dem_align(ref_dem, source_dem, max_displacement, outprefix, align, trans_only=False, threads=n_cpu,initial_align=None):
+def dem_align(ref_dem, source_dem, max_displacement, outprefix, align, trans_only=False, threads=n_cpu, initial_align=None):
     """
     This function implements the full DEM alignment workflow using ASP's pc_align and point2dem programs
     See relevent doumentation here:  https://stereopipeline.readthedocs.io/en/latest/tools/pc_align.html
@@ -724,6 +726,7 @@ def get_cam2rpc_opts(t='pinhole', dem=None, gsd=None, num_samples=50):
     cam2rpc_opts = []
     cam2rpc_opts.extend(['--dem-file', dem])
     cam2rpc_opts.extend(['--save-tif-image'])
+    cam2rpc_opts.extend(['--threads', str(iolib.cpu_count())])
     
     # these parameters are not required when providing a DEM
     # the lon-lat range and height-range is not required when sampling points from a DEM
@@ -765,8 +768,8 @@ def read_pc_align_transform(transformation):
     r21, r22, r23, t2 = ' '.join(content[1].split()).split(' ', 15)
     r31, r32, r33, t3 = ' '.join(content[2].split()).split(' ', 15)
     pc_align_rot = np.reshape(np.array(
-        [np.float(x) for x in [r11, r12, r13, r21, r22, r23, r31, r32, r33]]), (3, 3))
-    pc_align_trans = np.array([np.float(x) for x in [t1, t2, t3]])
+        [float(x) for x in [r11, r12, r13, r21, r22, r23, r31, r32, r33]]), (3, 3))
+    pc_align_trans = np.array([float(x) for x in [t1, t2, t3]])
     return pc_align_trans, pc_align_rot
 
 def align_cameras(pinhole_tsai, transform, outfolder='None',write=True, rpc=False, dem=None, gsd=None, img=False):
@@ -832,8 +835,8 @@ def read_px_error(content_line,idx):
     """
     pts_array = np.array(content_line)[idx]
     pts = np.char.split(pts_array,', ')
-    px = np.array([np.float(x[0]) for x in pts])
-    py = np.array([np.float(x[1]) for x in pts])
+    px = np.array([float(x[0]) for x in pts])
+    py = np.array([float(x[1]) for x in pts])
     return px,py
 
 def compute_cam_px_reproj_err_stats(content_line,idx):
@@ -1268,13 +1271,13 @@ def read_ip_record(mf):
     Input: - mf, file handle to the in put binary file (in 'rb' mode)
     Output: - iprec, array containing the IP record
     """
-    x, y = np.frombuffer(mf.read(8), dtype=np.float32)
+    x, y = np.frombuffer(mf.read(8), dtype=float32)
     xi, yi = np.frombuffer(mf.read(8), dtype=np.int32)
-    orientation, scale, interest = np.frombuffer(mf.read(12), dtype=np.float32)
+    orientation, scale, interest = np.frombuffer(mf.read(12), dtype=float32)
     polarity, = np.frombuffer(mf.read(1), dtype=np.int8)  # or np.bool?
     octave, scale_lvl = np.frombuffer(mf.read(8), dtype=np.uint32)
     ndesc, = np.frombuffer(mf.read(8), dtype=np.uint64)
-    desc = np.frombuffer(mf.read(int(ndesc * 4)), dtype=np.float32)
+    desc = np.frombuffer(mf.read(int(ndesc * 4)), dtype=float32)
     iprec = [x, y, xi, yi, orientation, scale, interest, polarity, octave, scale_lvl, ndesc]
     iprec.extend(desc)
     return iprec

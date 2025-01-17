@@ -1,8 +1,8 @@
-name: skysat_stereo
+name: skysat_stereo_snow
 channels:
  - conda-forge
 dependencies:
- # core data science 
+ # core data science
  - python
  - scipy
  - numpy
@@ -16,6 +16,8 @@ dependencies:
  - shapely
  - contextily
  - descartes
+ - rioxarray
+ - xarray
  # misc
  - pip
  - psutil

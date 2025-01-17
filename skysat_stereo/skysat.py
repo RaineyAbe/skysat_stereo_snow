@@ -695,8 +695,7 @@ def triplet_stereo_job_list(overlap_list,t,img_list,threads=4,ba_prefix=None,cam
         job_list_ = p_map(prepare_stereo_jobs_wrapper,img1_list,img2_list,[img_list]*num_img,
             [outfolder]*num_img,[t]*num_img,[threads]*num_img,[crop_map]*num_img,[ba_prefix]*num_img,
             [cam_fol]*num_img,[dem]*num_img,[block]*num_img,[texture]*num_img,[entry_point]*num_img)
-       
-        print(type(job_list_))
+        # print(type(job_list_))
         job_list.append(job_list_)
 
      
