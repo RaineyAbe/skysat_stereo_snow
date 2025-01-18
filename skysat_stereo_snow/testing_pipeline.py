@@ -9,11 +9,11 @@ import os,sys,glob
 from skysat_stereo import skysat_stereo_workflow as workflow
 
 # -----Input parameters
-site_name = "MCS"
-date = "20241003"
+site_name = "Banner"
+date = "20240419-1"
 base_path = "/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites"
 img_folder = os.path.join(base_path, site_name, date, 'SkySatScene')
-coreg_dem = glob.glob(os.path.join(base_path, site_name, 'refdem', '*.tif'))[0]
+coreg_dem = glob.glob(os.path.join(base_path, site_name, 'refdem', '*_merged.tif'))[0]
 ortho_dem = coreg_dem
 multispec_dir = os.path.join(base_path, site_name, date, f"{site_name}_{date}_4band_mosaic.tif")
 job_name = f"{site_name}_{date}"
@@ -112,11 +112,8 @@ if 1 in steps2run:
 
 
 # Trim ref DEMs to speed up computation, create stable surface masks and stable reference elevations for bundle adjustment
-coreg_stable_dem, ortho_stable_dem, epsg_code = workflow.prepare_stable_surfaces(coreg_dem, ortho_dem, multispec_dir, bound_fn, 
-                                                                                bound_buffer_fn, stable_surface_dir, 
-                                                                                ndvi_threshold, ndsi_threshold)
-coreg_dem = coreg_stable_dem.replace('_stable.tif', '.tif')
-ortho_dem = coreg_stable_dem.replace('_stable.tif', '.tif')
+coreg_dem, ortho_dem, epsg_code = workflow.prepare_reference_elevations(coreg_dem, ortho_dem, multispec_dir, bound_fn, bound_buffer_fn, stable_surface_dir, 
+                                                                        ndvi_threshold=0.5, ndsi_threshold=0.4, coreg_stable_only=False)
 
 
 if 2 in steps2run:
@@ -166,7 +163,7 @@ if 4 in steps2run:
     print('Step 4: Bundle adjustment')
     print('--------------------\n')
     workflow.bundle_adjustment(img_folder, ba_prefix, cam_gcp_directory, overlap_list=overlap_stereo_txt, 
-                               dem=coreg_stable_dem, num_iter=2000, num_pass=2)
+                               dem=coreg_dem, num_iter=2000, num_pass=2)
     
 
 if 5 in steps2run:

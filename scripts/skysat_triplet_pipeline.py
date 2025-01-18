@@ -203,6 +203,11 @@ def main():
                                         block=args.block_matching, crop_map=1, threads=2, overlap_pkl=overlap_stereo_pkl,
                                         cross_track=False)
 
+
+    # Coregister individual DEMs
+    
+    
+    
     if 6 in steps2run:
         print('\n--------------------')
         print('Step 6: Mosaic DEMs')
@@ -215,14 +220,14 @@ def main():
         workflow.dem_mosaic_wrapper(dir=os.path.abspath(final_stereo_dir), mode='triplet',
                                     out_folder=os.path.abspath(mos_dem_dir))
 
-    if 7 in steps2run:
-        print('\n--------------------')
-        print('Step 7: Align DEMs')
-        print('--------------------\n')
-        # now perform alignment
-        median_mos_dem = glob.glob(os.path.join(mos_dem_dir, '*_median_mos.tif'))[0]
-        print("Aligning DEMs")
-        workflow.alignment_wrapper_single(coreg_dem, source_dem=median_mos_dem, max_displacement=100, outprefix=os.path.join(alignment_dir, 'run-run'))
+    # if 7 in steps2run:
+    #     print('\n--------------------')
+    #     print('Step 7: Align DEMs')
+    #     print('--------------------\n')
+    #     # now perform alignment
+    #     median_mos_dem = glob.glob(os.path.join(mos_dem_dir, '*_median_mos.tif'))[0]
+    #     print("Aligning DEMs")
+    #     workflow.alignment_wrapper_single(coreg_dem, source_dem=median_mos_dem, max_displacement=100, outprefix=os.path.join(alignment_dir, 'run-run'))
 
     if 8 in steps2run:
         print('\n--------------------')

@@ -18,6 +18,10 @@ dependencies:
  - descartes
  - rioxarray
  - xarray
+ - xdem
+ # reference DEM querying
+ - earthengine-api
+ - geedim
  # misc
  - pip
  - psutil
