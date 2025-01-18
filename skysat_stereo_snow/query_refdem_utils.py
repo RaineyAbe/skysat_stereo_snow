@@ -7,6 +7,7 @@ import os
 import pyproj
 import subprocess
 import rioxarray as rxr
+import xarray as xr
 import numpy as np
 import matplotlib.pyplot as plt
 import ee
@@ -249,17 +250,30 @@ def coregister_dems(refdem_fn, dem_fn, dem_out_fn=None):
     return dem_out_fn
 
 
-def merge_dems(first_dem, second_dem, out_fn=None):
+def merge_dems(coregdem_fn, second_dem_fn, out_fn=None):
     if out_fn is None:
-        out_fn = os.path.splitext(first_dem)[0] + '__' + os.path.splitext(os.path.basename(second_dem))[0] + '_merged.tif'
+        out_fn = os.path.splitext(coregdem_fn)[0] + '__' + os.path.splitext(os.path.basename(second_dem_fn))[0] + '_merged.tif'
+    
     if not os.path.exists(out_fn):
-        # construct command 
-        cmd = ['gdal_merge.py', 
-               '-o', out_fn,
-               first_dem, second_dem]
-        out = subprocess.run(cmd, shell=False, capture_output=True)
-        print(out)
+        # Load input files
+        coregdem = rxr.open_rasterio(coregdem_fn).squeeze()
+        crs = coregdem.rio.crs
+        second_dem = rxr.open_rasterio(second_dem_fn).squeeze()
+
+        # Match projections, using coregdem resolution to project onto second_dem
+        second_dem = second_dem.rio.reproject(resolution=coregdem.rio.resolution(), dst_crs=crs)
+        coregdem_reproj = coregdem.rio.reproject_match(second_dem)
+
+        # Merge DEMs, replacing coregdem nodata values with second_dem
+        merged_dem = xr.where((coregdem_reproj==coregdem_reproj.rio.nodata) | (np.isnan(coregdem_reproj)),
+                            second_dem, coregdem_reproj)
+        merged_dem = merged_dem.rio.write_crs(crs)
+
+        # Save to file
+        merged_dem.rio.to_raster(out_fn)
+        print('Merged DEM saved to file:', out_fn)
+    
     else:
-        print('Merged DEM already exists, skipping.')
+        print('Merged DEM already exists in file, skipping.')
     
     return out_fn
