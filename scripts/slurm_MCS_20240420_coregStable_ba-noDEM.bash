@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH -J MCS_20241003         # job name
-#SBATCH -o output_MCS_20241003.o%j  # output and error file name (%j expands to jobID)
+#SBATCH -J MCS_20240420         # job name
+#SBATCH -o output_MCS_20240420.o%j  # output and error file name (%j expands to jobID)
 #SBATCH -n 1              # total number of tasks requested
 #SBATCH -c 48             # CPU cores per task
 #SBATCH -N 1              # number of nodes you want to run on
@@ -17,21 +17,23 @@ micromamba activate skysat_stereo_snow
 # Define some variables here for convenience
 base_dir="/bsuhome/raineyaberle/scratch/SkySat-Stereo"
 site_name="MCS"
-date="20241003"
+date="20240420"
 coregdem="${base_dir}/study-sites/${site_name}/refdem/${site_name}_refdem_lidar_COPDEM_merged.tif"
+#orthodem="${base_dir}/study-sites/${site_name}/refdem/MCS_COPDEM_buffer2km_WGS84_ellipsoid_UTM11_filled_coreg.tif"
 
 # Run the triplet stereo pipeline
 python ${base_dir}/skysat_stereo/scripts/skysat_triplet_pipeline.py \
 -in_img "${base_dir}/study-sites/${site_name}/${date}/SkySatScene" \
 -multispec "${base_dir}/study-sites/${site_name}/${date}/${site_name}_${date}_4band_mosaic.tif" \
--outfolder "${base_dir}/study-sites/${site_name}/${date}/COPDEM+AllLidar_ba-0.1m/" \
+-outfolder "${base_dir}/study-sites/${site_name}/${date}/coregStable_ba-noDEM" \
 -orthodem $coregdem \
 -coregdem $coregdem \
--coreg_stable_only 0 \
--coregdem_in_bundle_adjust 1 \
--coregdem_uncertainty 0.1 \
+-coreg_stable_only 1 \
+-ba_dem 0 \
+-ba_dem_uncertainty 5 \
+-ba_cam_weight 0 \
 -ndvi_threshold 0.4 \
--ndsi_threshold 0.0 \
+-ndsi_threshold 0.4 \
 -job_name "${site_name}_${date}" \
--full_workflow 0 \
--partial_workflow_steps 1 2 4 5 6 7 8 9 10
+-full_workflow 1 
+#-partial_workflow_steps 4 5 6 7 8 9 10

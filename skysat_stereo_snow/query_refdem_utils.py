@@ -14,6 +14,7 @@ import ee
 import json
 from shapely.geometry import Polygon
 import xdem
+from rasterio.enums import Resampling
 
 def convert_wgs_to_utm(lon: float, lat: float):
     """
@@ -41,7 +42,7 @@ def convert_wgs_to_utm(lon: float, lat: float):
     return epsg_code
 
 
-def create_bbox_from_meta(meta_fns, buffer):
+def create_bbox_from_meta(meta_fns, buffer, plot=True):
     # Iterate over metadata files
     xmin, xmax, ymin, ymax = 1e10, -1e10, 1e10, -1e10
     for meta_fn in meta_fns:
@@ -68,11 +69,12 @@ def create_bbox_from_meta(meta_fns, buffer):
     bounds_buffer_gdf = bounds_utm_buffer_gdf.to_crs('EPSG:4326')
 
     # Plot
-    fig, ax = plt.subplots(1,1,figsize=(6,6))
-    ax.plot(*bounds_gdf.geometry[0].exterior.coords.xy, '-k', label='Image bounds')
-    ax.plot(*bounds_buffer_gdf.geometry[0].exterior.coords.xy, '-m', label='Clipping geometry')
-    ax.legend(loc='upper right')
-    plt.show()
+    if plot:
+        fig, ax = plt.subplots(1,1,figsize=(6,6))
+        ax.plot(*bounds_gdf.geometry[0].exterior.coords.xy, '-k', label='Image bounds')
+        ax.plot(*bounds_buffer_gdf.geometry[0].exterior.coords.xy, '-m', label='Clipping geometry')
+        ax.legend(loc='upper right')
+        plt.show()
 
     return bounds_buffer_gdf, epsg_utm
 
@@ -250,24 +252,28 @@ def coregister_dems(refdem_fn, dem_fn, dem_out_fn=None):
     return dem_out_fn
 
 
-def merge_dems(coregdem_fn, second_dem_fn, out_fn=None):
+def merge_dems(coregdem_fn, second_dem_fn, out_fn=None, dstnodata=-9999, overwrite=False):
     if out_fn is None:
         out_fn = os.path.splitext(coregdem_fn)[0] + '__' + os.path.splitext(os.path.basename(second_dem_fn))[0] + '_merged.tif'
     
-    if not os.path.exists(out_fn):
+    if (not os.path.exists(out_fn)) | overwrite:
         # Load input files
         coregdem = rxr.open_rasterio(coregdem_fn).squeeze()
         crs = coregdem.rio.crs
         second_dem = rxr.open_rasterio(second_dem_fn).squeeze()
+        second_dem = second_dem.rio.write_nodata(coregdem.rio.nodata)
 
         # Match projections, using coregdem resolution to project onto second_dem
-        second_dem = second_dem.rio.reproject(resolution=coregdem.rio.resolution(), dst_crs=crs)
+        second_dem = second_dem.rio.reproject(resolution=coregdem.rio.resolution(), 
+                                              resampling=Resampling.bilinear,
+                                              dst_crs=crs)
         coregdem_reproj = coregdem.rio.reproject_match(second_dem)
 
         # Merge DEMs, replacing coregdem nodata values with second_dem
         merged_dem = xr.where((coregdem_reproj==coregdem_reproj.rio.nodata) | (np.isnan(coregdem_reproj)),
-                            second_dem, coregdem_reproj)
+                               second_dem, coregdem_reproj)
         merged_dem = merged_dem.rio.write_crs(crs)
+        merged_dem = merged_dem.rio.write_nodata(dstnodata)
 
         # Save to file
         merged_dem.rio.to_raster(out_fn)

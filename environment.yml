@@ -8,6 +8,7 @@ dependencies:
  - numpy
  - pandas
  - matplotlib
+ - ipykernel
  # geospatial (raster+vector)
  - gdal
  - rasterio
@@ -25,6 +26,7 @@ dependencies:
  # misc
  - pip
  - psutil
+ - seaborn
  - pip:
    # rotation_matrices
    - pyquaternion
@@ -35,4 +37,7 @@ dependencies:
    - "--editable=git+https://github.com/dshean/demcoreg.git#egg=demcoreg"
    - "--editable=git+https://github.com/ShashankBice/imview.git@isprs_version#egg=imview"
    - "--editable=git+https://github.com/cmla/rpcm.git#egg=rpcm"
-   # review and add bare
+   # Sx calculation
+   - topo-descriptors
+   # needed for xdem ICP coregistration
+   - opencv-python

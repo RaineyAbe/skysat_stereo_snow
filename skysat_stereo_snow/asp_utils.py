@@ -510,11 +510,8 @@ def get_stereo_opts(session='rpc',ep=0,threads=4,ba_prefix=None,align='Affineepi
     """
     # stereo_tri_args:
     disp_trip = 10000
-    if session == 'pinholemappinhole':
+    if not mvs:
         stereo_opt.extend(['--num-matches-from-disparity', str(disp_trip)])
-        stereo_opt.extend(['--unalign-disparity'])
-    elif not mvs:
-        stereo_opt.extend(['--num-matches-from-disp-triplets', str(disp_trip)])
         stereo_opt.extend(['--unalign-disparity'])
     return stereo_opt
 

@@ -18,20 +18,22 @@ micromamba activate skysat_stereo_snow
 base_dir="/bsuhome/raineyaberle/scratch/SkySat-Stereo"
 site_name="MCS"
 date="20241003"
-coregdem="${base_dir}/study-sites/${site_name}/refdem/${site_name}_refdem_lidar_COPDEM_merged.tif"
+coregdem="${base_dir}/study-sites/${site_name}/refdem/MCS_REFDEM_WGS84_ROADS-ONLY.tif"
+orthodem="${base_dir}/study-sites/${site_name}/refdem/MCS_refdem_lidar_COPDEM_merged.tif"
 
 # Run the triplet stereo pipeline
 python ${base_dir}/skysat_stereo/scripts/skysat_triplet_pipeline.py \
 -in_img "${base_dir}/study-sites/${site_name}/${date}/SkySatScene" \
 -multispec "${base_dir}/study-sites/${site_name}/${date}/${site_name}_${date}_4band_mosaic.tif" \
--outfolder "${base_dir}/study-sites/${site_name}/${date}/COPDEM+AllLidar_ba-10m/" \
--orthodem $coregdem \
+-outfolder "${base_dir}/study-sites/${site_name}/${date}/coregRoads_ba-u10m" \
+-orthodem $orthodem \
 -coregdem $coregdem \
 -coreg_stable_only 0 \
--coregdem_in_bundle_adjust 1 \
--coregdem_uncertainty 10 \
+-ba_dem 1 \
+-ba_dem_uncertainty 10 \
+-ba_cam_weight 0 \
 -ndvi_threshold 0.4 \
--ndsi_threshold 0.0 \
+-ndsi_threshold 0.4 \
 -job_name "${site_name}_${date}" \
 -full_workflow 0 \
--partial_workflow_steps 1 2 4 5 6 7 8 9 10
+-partial_workflow_steps 4 5 6 7 8 9 10

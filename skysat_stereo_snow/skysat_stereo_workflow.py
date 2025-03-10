@@ -19,6 +19,9 @@ import xarray as xr
 import rioxarray as rxr
 import matplotlib.pyplot as plt
 import matplotlib
+import geoutils as gu
+import xdem
+import multiprocessing
 
 def run_cmd(bin, args, **kw):
     """
@@ -46,7 +49,6 @@ def run_cmd(bin, args, **kw):
     call = [binpath,]
     if args is not None: 
         call.extend(args)
-    print(call)
     try:
         out = subprocess.run(call,check=True,capture_output=True,encoding='UTF-8').stdout
     except:
@@ -199,12 +201,33 @@ def skysat_preprocess(img_folder,mode,sampling=None,frame_index=None,product_lev
     return cam_gen_log   
 
 
-def construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold=0.5, ndsi_threshold=0.1, plot_results=True):
+def construct_land_cover_masks(multispec_dir, out_dir, ndvi_threshold=0.5, ndsi_threshold=0.0, plot_results=True):
+    # Make output directory if it doesn't exist
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+    
     # Define output files
     trees_mask_fn = os.path.join(out_dir, 'trees_mask.tif')
     snow_mask_fn = os.path.join(out_dir, 'snow_mask.tif')
     ss_mask_fn = os.path.join(out_dir, 'stable_surfaces_mask.tif')
     fig_fn = os.path.join(out_dir, 'land_cover_masks.png')
+    
+    # Check if multispec_dir is a directory of images or a single file
+    if os.path.isdir(multispec_dir):
+        multispec_mosaic_fn = os.path.join(out_dir, '4band_mosaic.tif')
+        # Check if mosaic exists
+        if not os.path.exists(multispec_mosaic_fn):
+            print('Mosacking 4-band SR images...')
+            # Grab all 4-band SR image file names
+            multispec_fns = sorted(glob.glob(os.path.join(multispec_dir, '*_SR.tif')))
+            # Construct gdal_merge arguments
+            merge_args = multispec_fns + ['--ot', 'Int16', '--no-bigtiff', '-o', multispec_mosaic_fn]
+            # Run command
+            run_cmd('image_mosaic', merge_args)
+        else:
+            print('4-band mosaic already exists, skipping gdal_merge.')
+    elif os.path.isfile(multispec_dir):
+        multispec_mosaic_fn = multispec_dir
 
     # Function to load 4-band mosaic if needed
     mosaic = None
@@ -215,8 +238,8 @@ def construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold=0.5,
         bands = ['blue', 'green', 'red', 'NIR']
         for i, b in enumerate(bands):
             mosaic[b] = mosaic_xr.isel(band=i)
-        mosaic = mosaic / 1e4
-        mosaic = xr.where(mosaic==0, np.nan, mosaic)
+        # account for image scalar and no data values
+        mosaic = xr.where(mosaic==0, np.nan, mosaic / 1e4)
         mosaic.rio.write_crs(crs, inplace=True)
         return mosaic, crs
 
@@ -228,13 +251,13 @@ def construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold=0.5,
         # Calculate NDVI
         ndvi = (mosaic.NIR - mosaic.red) / (mosaic.NIR + mosaic.red)
         # Apply threshold
-        trees_mask = (ndvi >= ndvi_threshold).astype(int)
+        trees_mask = xr.where(ndvi >= ndvi_threshold, 1, 0).astype(int)
         # Save to file
         trees_mask = xr.where(np.isnan(mosaic.blue), -9999, trees_mask) # set no data values to -9999
         trees_mask = trees_mask.assign_attrs({'Description': 'Trees mask constructing by thresholding the NDVI of the 4-band mosaic image.',
-                                            '_FillValue': -9999,
-                                            'NDVI bands': 'NIR, green',
-                                            'NDVI threshold': ndvi_threshold})
+                                              '_FillValue': -9999,
+                                              'NDVI bands': 'NIR, red',
+                                              'NDVI threshold': ndvi_threshold})
         trees_mask.rio.write_crs(crs, inplace=True)
         trees_mask.rio.to_raster(trees_mask_fn, dtype='int16')
         print('Trees mask saved to file:', trees_mask_fn)
@@ -248,8 +271,8 @@ def construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold=0.5,
             mosaic, crs = load_mosaic(multispec_mosaic_fn)
         # Calculate NDSI
         ndsi = (mosaic.red - mosaic.NIR) / (mosaic.red + mosaic.NIR)
-        # Apply threshold
-        snow_mask = (ndsi >= ndsi_threshold).astype(int)
+        # Apply thresholds
+        snow_mask = xr.where((ndsi >= ndsi_threshold) & (mosaic.red > 0.3), 1, 0).astype(int)
         # Save to file
         snow_mask = xr.where(np.isnan(mosaic.blue), -9999, snow_mask) # set no data values to -9999
         snow_mask = snow_mask.assign_attrs({'Description': 'Snow mask constructed by thresholding the NDSI of the orthomosaic image',
@@ -292,9 +315,9 @@ def construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold=0.5,
         snow_mask = rxr.open_rasterio(snow_mask_fn).squeeze()
         ss_mask = rxr.open_rasterio(ss_mask_fn).squeeze()
         # Define land cover colors
-        colors_dict = {'trees': '#006d2c', 
-                       'snow': '#4292c6', 
-                       'stable_surfaces': '#bdbdbd'}
+        colors_dict = {'trees': '#167700', 
+                       'snow': '#55F5FF', 
+                       'stable_surfaces': '#C3C3C3'}
         # Plot
         fig, ax = plt.subplots(1, 2, figsize=(10,5))
         # RGB image
@@ -325,9 +348,9 @@ def construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold=0.5,
 
     return trees_mask_fn, snow_mask_fn, ss_mask_fn
 
-def prepare_reference_elevations(coreg_dem_fn, ortho_dem_fn, multispec_dir, bound_fn, bound_buffer_fn, out_dir, 
-                                 ndvi_threshold=0.5, ndsi_threshold=0.4, coreg_stable_only=False):
-    # Check if output directory exists
+def prepare_reference_elevations(coreg_dem_fn=None, ortho_dem_fn=None, bound_fn=None, bound_buffer_fn=None, 
+                                 ss_mask_fn=None, coreg_stable_only=False, out_dir=None):
+    # Make output directory if it doesn't exist
     if not os.path.exists(out_dir):
         os.mkdir(out_dir)
 
@@ -343,26 +366,6 @@ def prepare_reference_elevations(coreg_dem_fn, ortho_dem_fn, multispec_dir, boun
         gdf_proj['geometry'] = gdf_proj.buffer(1000)
         gdf_proj.to_file(bound_buffer_fn, driver='GPKG')
     
-    # Check if multispec_dir is a directory of images or a single file
-    if os.path.isdir(multispec_dir):
-        multispec_mosaic_fn = os.path.join(out_dir, '4band_mosaic.tif')
-        # Check if mosaic exists
-        if not os.path.exists(multispec_mosaic_fn):
-            print('Mosacking 4-band SR images...')
-            # Grab all 4-band SR image file names
-            multispec_fns = sorted(glob.glob(os.path.join(multispec_dir, '*_SR.tif')))
-            # Construct gdal_merge arguments
-            merge_args = multispec_fns + ['--ot', 'Int16', '--no-bigtiff', '-o', multispec_mosaic_fn]
-            # Run command
-            run_cmd('image_mosaic', merge_args)
-        else:
-            print('4-band mosaic already exists, skipping gdal_merge.')
-    elif os.path.isfile(multispec_dir):
-        multispec_mosaic_fn = multispec_dir
-    
-    # Construct stable surfaces mask
-    trees_mask_fn, snow_mask_fn, ss_mask_fn = construct_land_cover_masks(multispec_mosaic_fn, out_dir, ndvi_threshold, ndsi_threshold, plot_results=True)
-
     # Trim DEMs to SkySat footprint + 1km buffer to speed up computations
     def trim_dem(dem_fn, bound_fn, out_dir):
         # copy DEM to output directory
@@ -374,14 +377,13 @@ def prepare_reference_elevations(coreg_dem_fn, ortho_dem_fn, multispec_dir, boun
             print("Cropping reference DEM to extent of SkySat footprint + 1 km buffer")
             misc.clip_raster_by_shp_disk(dem_fn, bound_fn)
             misc.ndvtrim_function(os.path.splitext(dem_fn)[0] + '_shpclip.tif')
-            # Use the median DEM value where there's no coverage in the images footprint
-            # dem_trim = rxr.open_rasterio(dem_trim_fn).squeeze()
-            # crs = dem_trim.rio.crs
-            # dem_trim = xr.where(dem_trim <= 0, np.nan, dem_trim)
-            # dem_trim_median = np.nanmedian(dem_trim.data)
-            # dem_trim = xr.where(np.isnan(dem_trim), dem_trim_median, dem_trim)
-            # dem_trim = dem_trim.rio.write_crs(crs)
-            # dem_trim.rio.to_raster(dem_trim_fn)
+            # Make sure no data values are set to NaN
+            dem_trim = rxr.open_rasterio(dem_trim_fn).squeeze()
+            crs = dem_trim.rio.crs
+            dem_trim = xr.where(dem_trim <= 0, np.nan, dem_trim)
+            dem_trim = dem_trim.rio.write_crs(crs)
+            dem_trim = dem_trim.rio.write_nodata(np.nan)
+            dem_trim.rio.to_raster(dem_trim_fn)
         return dem_trim_fn
     
     coreg_dem_fn = trim_dem(coreg_dem_fn, bound_buffer_fn, out_dir)
@@ -406,10 +408,108 @@ def prepare_reference_elevations(coreg_dem_fn, ortho_dem_fn, multispec_dir, boun
     return coreg_dem_fn, ortho_dem_fn, epsg_code
     
 
+def bundle_adjustment(img_folder, ba_prefix, cam, overlap_list=None, 
+                      refdem=None, ba_dem=None, ba_dem_uncertainty=10, cam_weight=0, num_iter=1000, num_pass=2):
+    # Create output directory
+    out_dir = os.path.dirname(ba_prefix)
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+    
+    # Grab list of images
+    img_list = sorted(glob.glob(os.path.join(img_folder,'*.tif')) + glob.glob(os.path.join(img_folder, '*.tiff')))
+    if len(img_list) < 2:
+        if os.path.islink(img_list[0]):
+            img_list = [os.readlink(x) for x in img_list] 
+    
+    # Filter to images with cameras (in case any failed in previous step)
+    cam_list = sorted(glob.glob(os.path.join(cam, '*.tsai')))
+    # img_list_new = [os.path.join(img_folder, os.path.basename(cam_fn).replace('_rpc.tsai', '.tif')) for cam_fn in cam_list]
+    img_list_new = [os.path.join(img_folder, os.path.basename(cam_fn).split('_rpc')[0])+ '.tif' for cam_fn in cam_list]
+    print(f"Out of the initial {len(img_list)} images, {len(img_list_new)} will be orthorectified using adjusted cameras")
+    img_list = img_list_new
+    # Check if there are enough images
+    if len(img_list) < 2:
+        raise Exception('Not enough images with cameras found')
+    
+    # Save list of images and cameras to file for reference
+    cam_list_txt = os.path.join(out_dir, 'round1_cameras.txt')
+    with open(cam_list_txt, "w") as f:
+        for cam in cam_list:
+            f.write(cam + "\n")
+    img_list_txt = os.path.join(out_dir, 'round1_images.txt')
+    with open(img_list_txt, "w") as f:
+        for img in img_list:
+            f.write(img + "\n")
+    
+    ## ROUND 1: with reference DEM (optional)
+    if ba_dem:
+        # Define bundle adjustment arguments
+        ba_args = ['--force-reuse-match-files',
+                   '--image-list', img_list_txt,
+                   '--camera-list', cam_list_txt,
+                    '--overlap-list', overlap_list,
+                    '--heights-from-dem', ba_dem,
+                    '--heights-from-dem-uncertainty', str(ba_dem_uncertainty),
+                    '--threads', str(iolib.cpu_count()),
+                    '--num-iterations', str(num_iter),
+                    '--num-passes', str(num_pass),
+                    '--remove-outliers-params', "75 3 20 20",
+                    '--camera-position-weight', str(cam_weight),
+                    '--min-matches', '4',
+                    '--ip-per-tile', '4000',
+                    '--ip-inlier-factor', '0.2',
+                    '--individually-normalize',
+                    '--inline-adjustments',
+                    '--save-cnet-as-csv',
+                    '-o', ba_prefix] 
+        
+        # Run bundle adjust
+        print(f'Running bundle adjust with reference DEM, uncertainty = {ba_dem_uncertainty} m')
+        print(ba_args)
+        run_cmd('parallel_bundle_adjust', ba_args)
+        
+        # Save new camera and images list for next round
+        cam_list_txt = os.path.join(out_dir, 'round2_cameras.txt')
+        new_cam_list = [os.path.join(out_dir, f'run-{os.path.basename(cam)}') for cam in cam_list]
+        with open(cam_list_txt, "w") as f:
+            for cam in new_cam_list:
+                f.write(cam + "\n")
+        img_list_txt = os.path.join(out_dir, 'round2_images.txt')
+        with open(img_list_txt, "w") as f:
+            for img in img_list:
+                f.write(img + "\n")
+    
+    ## ROUND 2: no reference DEM
+    # Define bundle adjust argumnents
+    ba_args = ['--image-list', img_list_txt,
+                '--camera-list', cam_list_txt,
+                '--overlap-list', overlap_list,
+                '--threads', str(iolib.cpu_count()),
+                '--num-iterations', str(num_iter),
+                '--num-passes', str(num_pass),
+                '--remove-outliers-params', "75 3 20 20",
+                '--camera-position-weight', str(cam_weight),
+                '--min-matches', '4',
+                '--ip-per-tile', '4000',
+                '--ip-inlier-factor', '0.2',
+                '--individually-normalize',
+                '--inline-adjustments',
+                '--save-cnet-as-csv',
+                '-o', ba_prefix + '-run'] 
+    
+    # Run bundle adjust
+    print('Running bundle adjust without reference DEM')
+    print(ba_args)
+    run_cmd('parallel_bundle_adjust', ba_args)
+        
+
 def execute_skysat_orthorectification(images,outdir,data='triplet',dem='WGS84',tr=None,tsrs=None,del_opt=False,cam_folder=None,ba_prefix=None,
     mode='science',session=None,overlap_list=None,frame_index_fn=None,copy_rpc=1,orthomosaic=0):
     """
     """
+    if not os.path.exists(outdir):
+        os.mkdir(outdir)
+    
     if mode == 'browse':
         """
         this block creates low-res orthomosaics from RPC info for browsing purpose only
@@ -516,9 +616,6 @@ def execute_skysat_orthorectification(images,outdir,data='triplet',dem='WGS84',t
                 cam_list = [glob.glob(os.path.join(os.path.abspath(cam_folder),os.path.splitext(os.path.basename(x))[0]+'*.tsai'))[0] for x in img_list]
         else:
             cam_list = [None]*len(img_list)
-            if ba_prefix:
-                # not yet implemented
-                ba_prefix_list = [ba_prefix]*len(img_list)
 
         print("Mapping given images")
         ortho_logs = p_map(asp.mapproject,img_list,out_list,session_list,dem_list,tr_list,srs_list,cam_list,
@@ -556,7 +653,7 @@ def execute_skysat_orthorectification(images,outdir,data='triplet',dem='WGS84',t
                 all_3_view_mos_logs = p_map(asp.dem_mosaic, [res_sorted_list]*3, [res_sorted_mosaic,median_mosaic,wt_avg_mosaic], 
                                           ['None']*3, [None]*3, ['first','median',None],[None]*3,num_cpus=4)
 
-                print("producing idependent mosaic for different views in parallel")
+                print("producing independent mosaic for different views in parallel")
                 indi_mos_count = len(time_list)
                 if indi_mos_count>3:
                     tile_size = 400
@@ -663,243 +760,6 @@ def execute_skysat_stereo(img,outfol,mode,session='rpc',dem=None,texture='high',
                     continue
 
 
-def add_cam_intrinsics(input_file, output_file, distortion_model='TSAI',
-                       intrinsics={'k1': -1e-12, 'k2': -1e-12, 'k3': -1e-12, 'p1': -1e-12, 'p2': -1e-12}):
-    # Read the .tsai file
-    with open(input_file, 'r') as file:
-        lines = file.readlines()
-    updated_lines = lines
-    # Remove NULL line
-    updated_lines = [line for line in updated_lines if line!='NULL\n']
-    # Add the distortion model
-    if f"{distortion_model}\n" not in updated_lines:
-        updated_lines.append(f"{distortion_model}\n")
-    # Add distortion parameters
-    for key in intrinsics.keys():
-        addition = f"{key} = {intrinsics[key]:.8f}\n"
-        if addition not in updated_lines:
-            updated_lines.append(addition)
-    # Save the updated file
-    with open(output_file, 'w') as file:
-        file.writelines(updated_lines)
-    # print('Saved updated camera file:', output_file)
-
-
-def bundle_adjustment(img_folder, ba_prefix, cam, overlap_list=None, 
-                      dem=None, dem_in_ba=False, dem_uncertainty=10, num_iter=1000, num_pass=2):
-    # Create output directory
-    out_dir = os.path.dirname(ba_prefix)
-    if not os.path.exists(out_dir):
-        os.mkdir(out_dir)
-    
-    # Grab list of images
-    img_list = sorted(glob.glob(os.path.join(img_folder,'*.tif')) + glob.glob(os.path.join(img_folder, '*.tiff')))
-    if len(img_list) < 2:
-        if os.path.islink(img_list[0]):
-            img_list = [os.readlink(x) for x in img_list] 
-    
-    # Filter to images with cameras (in case any failed in previous step)
-    cam_list = sorted(glob.glob(os.path.join(cam, '*.tsai')))
-    img_list_new = [os.path.join(img_folder, os.path.basename(cam_fn).replace('_rpc.tsai', '.tif')) for cam_fn in cam_list]
-    print(f"Out of the initial {len(img_list)} images, {len(img_list_new)} will be orthorectified using adjusted cameras")
-    img_list = img_list_new
-    # Check if there are enough images
-    if len(img_list) < 2:
-        raise Exception('Not enough images with cameras found')
-    
-    ## ROUND 1: fix first 3 cameras
-    # the concept is simple: first 3 cameras, and then corresponding first three cameras from next collection are fixed in the first go.
-    # these serve as a kind of #GCP, preventing a large drift in the triangulated points/camera extrinsics during optimization
-    img_time_identifier_list = np.array([os.path.basename(img).split('_')[1] for img in img_list])
-    img_time_unique_list = np.unique(img_time_identifier_list)
-    second_collection_list = np.where(img_time_identifier_list == img_time_unique_list[1])[0][[0,1,2]]
-    fix_cam_idx = np.array([0,1,2]+list(second_collection_list))    
-    fix_cam_idx_str = ' '.join(fix_cam_idx.astype(str))
-    # Define bundle adjustment arguments
-    ba_args = ['--fixed-camera-indices', fix_cam_idx_str,
-               '--overlap-list', overlap_list,
-               '--threads', str(iolib.cpu_count()),
-               '--num-iterations', str(num_iter),
-               '--num-passes', str(num_pass),
-               '--camera-position-weight', '0',
-               '--remove-outliers-params', "75 3 20 20",
-               '--min-matches', '4',
-               '--ip-per-tile', '4000',
-               '--ip-inlier-factor', '0.2',
-               '--individually-normalize',
-               '--inline-adjustments',
-               '--min-triangulation-angle', '0.0001',
-               '--save-cnet-as-csv',
-               '-o', ba_prefix] 
-    if dem_in_ba:
-        ba_args.extend(['--heights-from-dem', dem,
-                        '--heights-from-dem-uncertainty', str(dem_uncertainty)])
-    ba_args += img_list + cam_list
-    print('ROUND 1')
-    # print(ba_args)
-    run_cmd('bundle_adjust', ba_args)
-    
-    ### ROUND 2: refine with DEM, (optional) solve intrinsics
-    identifier = os.path.basename(cam_list[0]).split('_',14)[0][:2]
-    print(ba_prefix+'-{}*.tsai'.format(identifier))
-    cam_list = sorted(glob.glob(os.path.join(ba_prefix+ '-{}*.tsai'.format(identifier))))
-    fix_cam_idx2 = np.delete(np.arange(len(img_list),dtype=int),fix_cam_idx)
-    fix_cam_idx2_str = ' '.join(fix_cam_idx2.astype(str))
-    # Define bundle adjustment arguments
-    ba_args = ['--fixed-camera-indices', fix_cam_idx2_str,
-               '--force-reuse-match-files',
-               '--overlap-list', overlap_list,
-               '--threads', str(iolib.cpu_count()),
-               '--num-iterations', str(num_iter),
-               '--num-passes', str(num_pass),
-               '--camera-position-weight', '0',
-               '--remove-outliers-params', "75 3 20 20",
-               '--min-matches', '4',
-               '--ip-per-tile', '4000',
-               '--ip-inlier-factor', '0.2',
-               '--individually-normalize',
-               '--inline-adjustments',
-               '--min-triangulation-angle', '0.0001',
-               '--save-cnet-as-csv',
-               '-o', ba_prefix]
-    if dem_in_ba:
-        ba_args.extend(['--heights-from-dem', dem,
-                        '--heights-from-dem-uncertainty', str(dem_uncertainty)])
-    ba_args += img_list + cam_list
-    print('ROUND 2')
-    # print(ba_args)
-    run_cmd('bundle_adjust', ba_args)
-
-
-# def bundle_adjustment(img_folder, ba_prefix, cam, overlap_list=None, 
-#                       dem=None, num_iter=1000, num_pass=2, float_intrinsics=True):
-#     # Create output directory
-#     out_dir = os.path.dirname(ba_prefix)
-#     if not os.path.exists(out_dir):
-#         os.mkdir(out_dir)
-    
-#     # Grab list of images
-#     img_list = sorted(glob.glob(os.path.join(img_folder,'*.tif')) + glob.glob(os.path.join(img_folder, '*.tiff')))
-#     if len(img_list) < 2:
-#         if os.path.islink(img_list[0]):
-#             img_list = [os.readlink(x) for x in img_list] 
-    
-#     # Filter to images with cameras (some may have failed in previous step)
-#     cam_list = sorted(glob.glob(os.path.join(cam, '*.tsai')))
-#     img_list_new = [os.path.join(img_folder, os.path.basename(cam_fn).replace('_rpc.tsai', '.tif')) for cam_fn in cam_list]
-#     print(f"Out of the initial {len(img_list)} images, {len(img_list_new)} will be orthorectified using adjusted cameras")
-#     img_list = img_list_new
-#     # Check if there are enough images
-#     if len(img_list) < 2:
-#         raise Exception('Not enough images with cameras found')
-    
-#     ## ROUND 1: Solve extrinsics, fixed intrinsics
-#     # Sort image and camera lists by camera number to align with order in txt files later
-#     img_list.sort(key=lambda x: os.path.basename(x).split('_')[2])
-#     cam_list.sort(key=lambda x: os.path.basename(x).split('_')[2])
-#     # Write images file names to txt file
-#     img_txt_fn1 = os.path.join(out_dir, f'round1_images.txt')
-#     with open(img_txt_fn1, 'w') as file:
-#         for image_fn in img_list:
-#             file.write(f'{image_fn}\n')
-#     # Write camera file names to text file
-#     cam_txt_fn1 = os.path.join(out_dir, f'round1_cameras.txt')
-#     with open(cam_txt_fn1, 'w') as file:
-#         for cam_fn in cam_list:
-#             file.write(f'{cam_fn}\n')
-        
-#     # Define bundle adjustment arguments
-#     ba_args = ['--image-list', img_txt_fn1,
-#                '--camera-list', cam_txt_fn1,
-#                '--overlap-list', overlap_list,
-#                '--threads', str(iolib.cpu_count()),
-#                '--num-iterations', str(num_iter),
-#                '--num-passes', str(num_pass),
-#                '--camera-position-weight', '0',
-#                '--remove-outliers-params', "75 3 20 20",
-#                '--min-matches', '4',
-#                '--ip-per-tile', '2000',
-#                '--individually-normalize',
-#                '--inline-adjustments',
-#                '--min-triangulation-angle', '0.0001',
-#                '--save-cnet-as-csv',
-#                '-o', ba_prefix]
-#     # print(ba_args)
-#     print("Running bundle adjustment round 1")
-#     run_cmd('bundle_adjust', ba_args)
-    
-#     ### ROUND 2: refine with DEM, (optional) solve intrinsics
-#     if float_intrinsics:
-#         # Split cameras into individual files
-#         def extract_unique_cam_strings(file_list):
-#             ssc_pattern = re.compile(r'ssc\d+d\d+')
-#             unique_ssc_strings = set()
-#             for file_name in file_list:
-#                 match = ssc_pattern.search(file_name)
-#                 if match:
-#                     unique_ssc_strings.add(match.group())
-#             return list(unique_ssc_strings)
-#         cam_strings = extract_unique_cam_strings(cam_list)
-#         print('Number of unique cameras:', len(cam_strings))
-    
-#         # Add initial intrinsics to cameras
-#         print('Adding initial intrinsics parameters to camera files')
-#         cam_list_out = [os.path.join(out_dir, os.path.basename(cam_fn)) for cam_fn in cam_list]
-#         p_map(add_cam_intrinsics, cam_list, cam_list_out, num_cpus=iolib.cpu_count())
-    
-#         # Write separate text files for each camera
-#         for cam_string in cam_strings:
-#             cam_fns_string = [cam_fn for cam_fn in cam_list_out if cam_string in cam_fn]
-#             img_fns = [os.path.join(img_folder, os.path.basename(cam_fn).replace('_rpc.tsai', '.tif')) 
-#                     for cam_fn in cam_fns_string]
-#             # Write image file names to text file
-#             with open(os.path.join(out_dir, f'round2_{cam_string}_images.txt'), 'w') as file:
-#                 for image_fn in img_fns:
-#                     file.write(f'{image_fn}\n')
-#             # Write camera file names to text file
-#             with open(os.path.join(out_dir, f'round2_{cam_string}_cameras.txt'), 'w') as file:
-#                 for cam_fn in cam_fns_string:
-#                     file.write(f'{cam_fn}\n') 
-#         img_txt_fns = sorted(glob.glob(os.path.join(out_dir, 'round2*images.txt')))
-#         cam_txt_fns = sorted(glob.glob(os.path.join(out_dir, 'round2*cameras.txt')))
-#         img_txt_fn2 = ','.join(img_txt_fns)
-#         cam_txt_fn2 = ','.join(cam_txt_fns)
-#         cam_wt = '100'
-    
-#     else:
-#         img_txt_fn2 = img_txt_fn1
-#         cam_txt_fn2 = cam_txt_fn1
-#         cam_wt = '0'
-        
-#     # Define bundle adjustment arguments
-#     ba_args = ['--image-list', img_txt_fn2,
-#                '--camera-list', cam_txt_fn2,
-#                '--overlap-list', overlap_list,
-#                '--heights-from-dem', dem,
-#                '--heights-from-dem-uncertainty', '6',
-#                '--force-reuse-match-files',
-#                '--match-files-prefix', ba_prefix,
-#                '--threads', str(iolib.cpu_count()),
-#                '--num-iterations', str(num_iter),
-#                '--num-passes', str(num_pass),
-#                '--camera-position-weight', cam_wt,
-#                '--remove-outliers-params', "75 3 20 20",
-#                '--min-matches', '4',
-#                '--ip-per-tile', '4000',
-#                '--individually-normalize',
-#                '--inline-adjustments',
-#                '--min-triangulation-angle', '0.0001',
-#                '--save-cnet-as-csv',
-#                '-o', ba_prefix + '-run']
-
-#     if float_intrinsics:
-#         ba_args.extend(['--solve-intrinsics',
-#                         '--intrinsics-to-float', "optical_center,focal_length,other_intrinsics"])
-#     # print(ba_args)
-#     print('Running bundle adjustment round 2')
-#     run_cmd('bundle_adjust', ba_args)
-
-
 def gridding_wrapper(pc_list,tr,tsrs=None):
     if tsrs is None:
         print("Projected Target CRS not provided, reading from the first point cloud")
@@ -922,52 +782,176 @@ def gridding_wrapper(pc_list,tr,tsrs=None):
     job_list = [point2dem_opts + [pc] for pc in pc_list]
     p2dem_log = p_map(asp.run_cmd,['point2dem'] * len(job_list), job_list, num_cpus = n_cpu)
     print(p2dem_log)
+
+
+def dem_mosaic_wrapper(dem_list, out_folder, tr=2, tsrs='EPSG:4326', tile_size=None):
+    # Make output folder if it does not exist
+    if out_folder is None:
+        out_folder = os.path.join(dir,'composite_dems')
+    if not os.path.exists(out_folder):
+        os.makedirs(out_folder)
     
+    # Mosaic DEMs
+    print(f"Mosaicing {len(dem_list)} DEM strips using median, count, and NMAD operators")
+    stats_list = ['median','count','nmad']
+    for stat in stats_list:
+        out_fn = os.path.join(out_folder, f'dem_{stat}_mos.tif')
+        print(f"Creating {stat} mosaic")
+        out_log = asp.dem_mosaic(dem_list, out_fn, tr=str(tr), tsrs=tsrs, stats=stat, tile_size=tile_size)
+        print(out_log)
+        # Save log
+        out_log_fn = out_fn.replace('.tif', '.log')
+        print("Saving triplet DEM mosaic log at {}".format(out_log_fn))
+        with open(out_log_fn,'w') as f:
+            f.write(out_log)
+
+
+def align_individual_dems(dem_list, refdem_fn, out_dir, max_displacement=40, tr=0.5):
+    """
+    Coregisters a list of DEMs to a reference DEM. For DEMs without at least 10% coverage of the reference DEM,
+    the function will create a median mosaic of the aligned DEMs and iteratively coregister remaining DEMs 
+    until no additional DEMs have sufficient overlap.
     
-def alignment_wrapper_single(ref_dem,source_dem,max_displacement,outprefix,
-                             align='point-to-plane',trans_only=0,initial_align=None):
-    if trans_only == 0:
-        trans_only = False
-    else:
-        trans_only = True
-    asp.dem_align(ref_dem, source_dem, max_displacement, outprefix, align,
-                  trans_only, threads=iolib.cpu_count(), initial_align=initial_align)
+    Parameters
+    ----------  
+    dem_list: list
+        List of DEM file paths to be coregistered.
+    refdem_fn: str
+        File path to the reference DEM.
+    out_dir: str
+        Output directory for aligned DEMs.
+    max_displacement: int
+    tr: float
+        Resolution of the output DEMs.
     
-def alignment_wrapper_multi(ref_dem,source_dem_list,max_displacement,align='point-to-plane',initial_align=None,
-                            trans_only=0):
-    outprefix_list=['{}_aligned_to{}'.format(os.path.splitext(source_dem)[0],os.path.splitext(os.path.basename(ref_dem))[0]) for source_dem in source_dem_list]
-    if trans_only == 0:
-        trans_only = False
-    else:
-        trans_only = True
-    n_source = len(source_dem_list)
+    Returns
+    ----------
+    None
+    """
+    # Create output directory if it doesn't exist
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+        
+    # Define function to get percent coverage of the reference DEM for a given DEM
+    def get_coverage(refdem, dem_fn):
+        dem = xdem.DEM(dem_fn, load_data=True)
+        ref = refdem.reproject(dem)
+        npx = np.where((dem.data.mask == False) & (ref.data.mask == False), 1, 0).sum()
+        return {"filename": dem_fn, "refdem_percent_coverage": npx / dem.data.size * 100}
+
+    # Define function to align a DEM to the reference DEM
+    def align_dem(dem_fn, refdem_fn, out_dir, max_displacement=40, threads=4, tr=0.5, output_prefix=None):
+        if output_prefix is None:
+            output_prefix = os.path.join(out_dir, os.path.split(os.path.dirname(dem_fn))[1] + '-run')
+        align_out_fn = output_prefix + '-trans_source.tif'
+        grid_out_fn = output_prefix + '-trans_source-DEM.tif'
+        if not os.path.exists(align_out_fn):
+            align_cmd = ['--max-displacement', str(max_displacement), '--threads', str(threads),
+                         '--highest-accuracy', '--save-transformed-source-points', '-o', output_prefix,
+                         refdem_fn, dem_fn]
+            run_cmd('pc_align', align_cmd)
+        if os.path.exists(align_out_fn) and not os.path.exists(grid_out_fn):
+            grid_cmd = ['--tr', str(tr), align_out_fn]
+            run_cmd('point2dem', grid_cmd)
     
-    initial_align = [initial_align]*n_source
-    ref_dem_list=[ref_dem] * n_source
-    max_disp_list=[max_displacement] * n_source
-    align_list=[align] * n_source
-    trans_list=[trans_only] * n_source
-    p_umap(asp.dem_align,ref_dem_list,source_dem_list,max_disp_list,outprefix_list,
-           align_list,trans_list,[1]*n_source,initial_align,num_cpus = iolib.cpu_count())
+    # Define function to create median mosaic of a list of DEMs
+    def create_median_mosaic(dem_list, out_fn):
+        mosaic_cmd = dem_list + ['--median', '--tr', str(tr), '-o', out_fn]
+        run_cmd('dem_mosaic', mosaic_cmd)
+
+    # Calculate percent coverage of the reference DEM for each DEM
+    print('Calculating percent coverage of the reference DEM for each DEM')
+    refdem = xdem.DEM(refdem_fn, load_data=True)
+    coverage_data = p_map(lambda x: get_coverage(refdem, x), dem_list, num_cpus=int(multiprocessing.cpu_count()/2))
+    coverage_df = pd.DataFrame(coverage_data)
     
-def align_cameras_wrapper(input_camera_list,transform_txt,outfolder,rpc=0,dem='None',img_list=None):
-    n_cam=len(input_camera_list)
-    if (rpc == 1) & (dem != 'None'):
-        print("Will also write RPC files")
-        rpc = True
-    else:
-        dem = None
-        img_list = [None] * n_cam
-        rpc = False
-    transform_list = [transform_txt]*n_cam
-    outfolder = [outfolder] * n_cam
-    write = [True] * n_cam
-    rpc = [rpc] * n_cam
-    dem = [dem] * n_cam
+    # ROUND 1: Coregister DEMs with at least 10% overlap to the reference DEM
+    dem_align_list = coverage_df[coverage_df['refdem_percent_coverage'] >= 10]['filename'].tolist()
+    if not dem_align_list:
+        print("No DEMs with at least 10% coverage of the reference DEM.")
+        return
+    print(f'Number of DEMs with reference DEM coverage >= 10%: {len(dem_align_list)}')
+    for dem_fn in tqdm(dem_align_list):
+        align_dem(dem_fn, refdem_fn, out_dir, max_displacement=max_displacement, threads=multiprocessing.cpu_count())
+    # Create median mosaic of aligned DEMs
+    mosaic_fn = os.path.join(out_dir, 'aligned_dem_mosaic.tif')
+    print(f'Creating median mosaic of {len(dem_align_list)} aligned DEMs')
+    create_median_mosaic(dem_align_list, mosaic_fn)
     
-    p_umap(asp.align_cameras,input_camera_list,transform_list,outfolder,write,rpc,dem,
-           img_list,num_cpus = iolib.cpu_count())
+    # ROUND 2+: Coregister the remaining DEMs to the median mosaic of the aligned DEMs
+    remaining_dems = [x for x in dem_list if x not in dem_align_list]
+    while remaining_dems:        
+        # Check which remaining DEMs have at least 10% coverage of the new median mosaic
+        mosaic = xdem.DEM(mosaic_fn, load_data=True)
+        coverage_data = p_map(lambda x: get_coverage(mosaic, x), remaining_dems, num_cpus=int(multiprocessing.cpu_count()/2))
+        coverage_df = pd.DataFrame(coverage_data)
+        new_align_list = coverage_df[coverage_df['refdem_percent_coverage'] >= 10]['filename'].tolist()
+        if not new_align_list:
+            print("No additional DEMs with at least 10% coverage of the median mosaic. Stopping.")
+            break
+        print(f'Number of additional DEMs with median mosaic coverage >= 10%: {len(new_align_list)}')
+        # Coregister the new DEMs
+        for dem_fn in tqdm(new_align_list):
+            align_dem(dem_fn, mosaic_fn, out_dir, max_displacement=max_displacement, threads=multiprocessing.cpu_count())
+        # Update the list of aligned and remaining DEMs
+        dem_align_list.extend(new_align_list)
+        remaining_dems = [x for x in remaining_dems if x not in dem_align_list]
+
+        # Create new median mosaic of all aligned DEMs
+        final_mosaic_fn = os.path.join(out_dir, 'aligned_dem_mosaic.tif')
+        print(f'Creating new median mosaic of {len(dem_align_list)} aligned DEMs')
+        create_median_mosaic(dem_align_list, final_mosaic_fn)
     
+    print("Coregistration process complete!")
+
+
+def align_dem(refdem_fn, dem_fn, out_dir, max_displacement=100, tr=2):
+    # Make output directory if it does not exist
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+        
+    # Round 1: ICP
+    print('Round 1: Align DEMs using ICP point-to-plane method')
+    # define outputs
+    output_prefix = os.path.join(out_dir, 'run-icp')
+    align_out_fn = output_prefix + '-trans_source.tif'
+    grid_out_fn = output_prefix + '-trans_source-DEM.tif'
+    # align
+    if not os.path.exists(align_out_fn):
+        align_cmd = ['--max-displacement', str(max_displacement), 
+                        '--threads', str(multiprocessing.cpu_count()),
+                        '--highest-accuracy', 
+                        '--save-transformed-source-points', 
+                        '--alignment-method', 'point-to-plane',
+                        '-o', output_prefix,
+                        refdem_fn, dem_fn]
+        out = run_cmd('pc_align', align_cmd)
+        print(out)
+    # grid
+    if os.path.exists(align_out_fn) and not os.path.exists(grid_out_fn):
+        grid_cmd = ['--tr', str(tr), align_out_fn]
+        out = run_cmd('point2dem', grid_cmd)
+        print(out)
+    
+    # Round 2: Nuth and Kaab
+    print('Round 2: Align DEMs using Nuth and Kaab method')
+    # define outputs
+    dem_nk_out_fn = os.path.join(out_dir, 'run-nk-DEM.tif')
+    # load inputs
+    if not os.path.exists(dem_nk_out_fn):
+        dem = xdem.DEM(grid_out_fn, load_data=True)
+        refdem = xdem.DEM(refdem_fn, load_data=True).reproject(dem)
+        # align
+        nk = xdem.coreg.NuthKaab().fit(refdem, dem)
+        print(nk._meta)
+        dem_nk = nk.apply(dem)
+        # save output
+        dem_nk.save(dem_nk_out_fn)
+        print('Nuth and Kaab alignment complete!')
+        print('Aligned DEM saved to:', dem_nk_out_fn)    
+
+    return dem_nk_out_fn
+
 
 def plot_composite_fig(ortho_fn, georegistered_median_dem_fn, count_fn, nmad_fn, outfn=None):
     import matplotlib.pyplot as plt
@@ -975,7 +959,6 @@ def plot_composite_fig(ortho_fn, georegistered_median_dem_fn, count_fn, nmad_fn,
     import rasterio as rio
     from matplotlib import colors
     import numpy as np
-    from mpl_toolkits.axes_grid1 import make_axes_locatable
 
     # Read files
     def read_data(raster):
@@ -1015,7 +998,7 @@ def plot_composite_fig(ortho_fn, georegistered_median_dem_fn, count_fn, nmad_fn,
                             1, '1 km', 'lower right', 
                             pad=0.3,
                             color='black',
-                            frameon=False,
+                            frameon=True,
                             size_vertical=0.01)
     ax[0].add_artist(scalebar)
     # Shaded relief
@@ -1046,121 +1029,278 @@ def plot_composite_fig(ortho_fn, georegistered_median_dem_fn, count_fn, nmad_fn,
     print('Final figure saved to file:', outfn)
     plt.close()
 
-    
-def dem_mosaic_wrapper(dir,mode='triplet',out_folder=None,identifier=None,tile_size=None,filter_dem=1,min_video_count=2,max_video_nmad=5):
-    if out_folder is None:
-        out_folder = os.path.join(dir,'composite_dems')
-    
-    if not os.path.exists(out_folder):
-        os.makedirs(out_folder)
-    if identifier is None:
-        identifier = ''
-    if mode == 'triplet':
-        dir_list = sorted(glob.glob(os.path.join(dir,'20*/')))
-        print(f"Number of combinations {len(dir_list)}")
-        
-        def valid_disp(direc):
-            try:
-                D_sub = iolib.fn_getma(os.path.join(direc,'run-D_sub.tif'),3)
-                stats = np.percentile(D_sub.compressed(),(2,98))
-                direc_out = glob.glob(os.path.join(direc,'run*{}*-DEM.tif'.format(identifier)))[0]
-                out = (direc_out,True)
-            except:
-                out = (0,False)
-            return out
 
+def initial_alignment_old(pc_dir, cam_dir, out_dir, refdem_fn, epsg_code):
+    # Create alignment directory if it doesn't exist
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
     
-        # find all valid DEMs
-        total_cpu = iolib.cpu_count()
-        n_proc = total_cpu - np.arange(len(dir_list))
-        #this setup is so that old pools are discarded and new ones with new number of workers are created
-        valid_dem_dir_list = []
-        for idx,direc in enumerate(tqdm(dir_list)):
-            comb_dir_list = sorted(glob.glob(os.path.join(direc,'*/')))
-            results = p_map(valid_disp,comb_dir_list,num_cpus=n_proc[idx])
-            t_val = [r[1] for r in results]
-            valid_dirs = list(itertools.compress([r[0] for r in results],t_val))
-            valid_dem_dir_list.append(valid_dirs)
+    # Check if DEMs already exist
+    dem_list = sorted(glob.glob(os.path.join(pc_dir, '20*', '20*', 'run-DEM.tif')))
+    if len(dem_list) < 1:    
+        # Convert individual point clouds to DEMs
+        pc_list = sorted(glob.glob(os.path.join(pc_dir, '20*', '20*', 'run-PC.tif')))
+        print(f"Gridding {len(pc_list)} point clouds")
+        gridding_wrapper(pc_list, tr=2)
         
-        # naming logic for pairwise and triplet/multiview composites
-        mdt1,t1,mdt2,t2 = [[],[],[],[]]
-        combination_out_list = []
-        if len(dir_list)>3:
-            print("Input is cross-track")
-        if dir_list[0][-1] == '/':
-            dir_list = [x[:-1] for x in dir_list]
-        for direc in dir_list:
-            combination_out_list.append(os.path.join(out_folder,os.path.basename(direc)+'_wt_avg_mos.tif'))
-            a,b,c,d = os.path.basename(direc).split('_')
-            mdt1.append(a) #master date (year month date)
-            t1.append(b) # time of day in seconds
-            mdt2.append(c)
-            t2.append(d)
-        if len(direc)>3:
-            composite_prefix = 'multiview_'+'_'.join(np.unique(mdt1+mdt2))+'__'+'_'.join(np.unique(t1+t2))
-        elif len(direc) < 1:
-            composite_prefix = 'stereo_'+'_'.join(np.unique(mdt1+mdt2))+'__'+'_'.join(np.unique(t1+t2))
+        # Get the output DEMs
+        dem_list = sorted(glob.glob(os.path.join(pc_dir, '20*', '20*', 'run-DEM.tif')))
+    
+    # Create median mosaic
+    median_mos_dem = os.path.join(out_dir, 'intermediate_median_mos.tif')
+    asp.dem_mosaic(dem_list, median_mos_dem, tr='2', tsrs=epsg_code,stats='median')
+    
+    # Coregister median mosaic to reference DEM
+    print("Aligning DEMs")
+    alignment_wrapper_single(refdem_fn, source_dem=median_mos_dem, max_displacement=40, outprefix=os.path.join(out_dir, 'run'))
+    
+    # Adjust cameras accordingly
+    camera_list = sorted(glob.glob(os.path.join(cam_dir, '*.tsai')))
+    print(f"Detected {len(camera_list)} cameras to be registered to DEM")
+    alignment_vector = glob.glob(os.path.join(out_dir, 'alignment_vector.txt'))[0]
+    print("Aligning cameras")
+    align_cameras_wrapper(input_camera_list=camera_list, transform_txt=alignment_vector, outfolder=out_dir)
+    aligned_camera_list = sorted(glob.glob(os.path.join(out_dir, '*.tsai')))
+
+
+def filter_stereo_jobs(mapproj_stats_fn=None, gsd_thresh=4, overlap_pkl=None, overlap_filt_pkl=None):
+    """
+    Use bundle adjustment mapproj stats to filter which images get run through stereo. 
+    See the Ames Stereo Pipeline documentation 16.5.11.10 for more info: https://stereopipeline.readthedocs.io/en/latest/tools/bundle_adjust.html#bundle-adjust
+    
+    Parameters
+    ----------
+    mapproj_stats_fn: str
+        path to the "*-mapproj_match_offset_stats.txt" file output from bundle adjustment run with the "--mapproj-dem" flag.
+    gsd_thresh: int,float
+        threshold for the maximum median Ground Sample Distance (GSD) of a given image between mapprojected points w.r.t. other images
+    overlap_pkl: str
+        file name of the pickle file containing image pairs with stereo overlap
+    overlap_filt_pkl:
+        output file name for the filtered stereo overlap list (pickle format)
+    
+    Returns
+    ----------
+    img_list_filt: list of str
+        list of image file names to run stereo on
+    overlap_filt_pkl: str
+        output file name for the filtered stereo overlap list (pickle format) 
+    overlap_filt_txt
+        output file name for the filtered stereo overlap list (TXT format)
+    """
+    # Read the mapproj stats file
+    with open(mapproj_stats_fn, 'r') as file:
+        lines = file.readlines()
+    column_names = lines[1].lstrip('#').strip().split()
+    mapproj_df = pd.read_csv(mapproj_stats_fn, skiprows=2, names=column_names, sep=' ')
+
+    # Filter images using the median GSD difference w.r.t. other images
+    mapproj_df_filt = mapproj_df.loc[mapproj_df['50%'] < gsd_thresh]
+    img_list_filt = sorted(mapproj_df_filt['image_name'].values)
+    print(f'{len(mapproj_df)-len(mapproj_df_filt)} images removed due to less reliable bundle adjustment results, {len(mapproj_df_filt)} images remain for stereo workflow.')
+
+    # Update overlap file for stereo jobs
+    if overlap_filt_pkl is None:
+        overlap_filt_pkl = overlap_pkl.replace('.pkl', '_filtered.pkl')
+    overlap = pd.read_pickle(overlap_pkl)
+    overlap_filt = overlap.loc[(overlap['img1'].isin(img_list_filt)) & (overlap['img2'].isin(img_list_filt))]
+    overlap_filt.to_pickle(overlap_filt_pkl)
+    # Save as txt file as well
+    overlap_filt_txt = os.path.splitext(overlap_filt_pkl)[0] + '.txt'
+    overlap_filt[['img1', 'img2']].to_csv(overlap_filt_txt, sep=' ', index=False, header=False)
+    print(f'Reduced number of stereo jobs from {len(overlap)} to {len(overlap_filt)}')
+    
+    return img_list_filt, overlap_filt_pkl, overlap_filt_txt
+
+
+def coregister_individual_dems(in_dir, out_dir, griddem_fn):
+    """
+    Coregister individual DEMs to each other using the ICP point-to-plane method.
+    
+    Parameters
+    ----------
+    in_dir: str
+        path to input folder containing subfolders with DEMs. Typically, the "final_pinhole_stereo" folder generated in the pipeline.
+    out_dir: str
+        path to output folder
+    griddem_fn: str
+        file name of the reference DEM used for gridding before coregistration
+    
+    Returns
+    ----------
+    dem_mos_fn: str
+        file name of the median DEM mosaic created from all coregistered DEMs. 
+    nmad_mos_fn: str
+        file name of the NMAD mosaic created from all coregistered DEMs. 
+    count_mos_fn: str
+        file name of the NMAD mosaic created from all coregistered DEMs.
+    """
+    # Define some functions
+    def get_dem_bbox(dem_fn):
+        xmin, ymin, xmax, ymax = list(gu.Raster(dem_fn).bounds)
+        bbox = Polygon([[xmin, ymin], [xmax, ymin],
+                        [xmax, ymax], [xmin, ymax], [xmin, ymin]])
+        return bbox
+
+    def get_dem_area(dem_fn):
+        dem_bbox = get_dem_bbox(dem_fn)
+        return dem_bbox.area
+
+    def get_overlapping_dems(reference_fn, dem_list):
+        reference_bbox = get_dem_bbox(reference_fn)
+        overlapping_dem_list = []
+        for dem_fn in dem_list:
+            dem_bbox = get_dem_bbox(dem_fn)
+            if dem_bbox.intersects(reference_bbox):
+                overlapping_dem_list.append(dem_fn)
+        # Filter to those with overlapping data values
+        overlapping_dem_dict = {}
+        reference = xdem.DEM(reference_fn)
+        for dem_fn in overlapping_dem_list:
+            dem = xdem.DEM(dem_fn).reproject(reference)
+            ddem = dem - reference
+            n_nodata = len(dem.data.mask[ddem.data.mask==False])
+            if n_nodata > 0:
+                overlapping_dem_dict[dem_fn] = n_nodata * reference.res[0] * reference.res[1]
+        return overlapping_dem_dict
+
+    # def align_dems(reference_fn, source_fn, out_prefix):
+        # reference = xdem.DEM(reference_fn).reproject(grid_dem)
+        # source = xdem.DEM(source_fn).reproject(grid_dem)
+        # nk = xdem.coreg.NuthKaab(subsample=1).fit(reference, source)
+        # source_corr = nk.apply(source)
+        # source_corr.save(source_out_fn)
+
+    def mosaic_dems(dem_list, out_fn, stat, print_output=False):
+        threads = iolib.cpu_count()
+        args = ['--tr', '2', 
+                f'--{stat}',
+                '--threads', str(threads), 
+                '-o', out_fn] + dem_list 
+        out = run_cmd('dem_mosaic', args)
+        if print_output:
+            print(out)
+        return out
+
+    # Load DEM for gridding
+    griddem = xdem.DEM(griddem_fn)
+    griddem = griddem.reproject(dst_crs=griddem.crs, dst_res=[5,5])
+    
+    # Create output folder
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+
+    # Copy and rename individual DEMs into out_fol
+    dem_list = glob.glob(os.path.join(in_dir, '20*', '20*', 'run-DEM.tif'))
+    for dem in dem_list:
+        new_dem = os.path.join(out_dir, dem.split('/')[-2] + '_run-DEM.tif')
+        if not os.path.exists(new_dem):
+            shutil.copy2(dem, new_dem)
+    dem_list = glob.glob(os.path.join(out_dir, '20*_map_run-DEM.tif'))
+
+    # Identify the largest DEM
+    dem_areas = np.array([get_dem_area(dem_fn) for dem_fn in dem_list])
+    imax = np.argwhere(dem_areas==np.max(dem_areas)).ravel()[0]
+    reference_dem_fn = dem_list[imax]
+    print(f'Starting with {reference_dem_fn} as the reference')
+    coregistered_list = [reference_dem_fn]
+    tba_dem_list = [dem_fn for dem_fn in dem_list if dem_fn!=reference_dem_fn]
+    print(f'{len(tba_dem_list)} DEMs to be coregistered')
+
+    # Start a progress bar
+    pbar = tqdm(total=len(dem_list))
+    pbar.update(1)
+
+    # Begin coregistration
+    while tba_dem_list:
+        # Get overlapping DEMs
+        overlapping_dems = get_overlapping_dems(reference_dem_fn, tba_dem_list)
+        # sort by area of overlap
+        overlapping_dems = dict(sorted(overlapping_dems.items(), key=lambda item: item[1], reverse=True))
+        if len(overlapping_dems) > 0:
+            source_dem = list(overlapping_dems.keys())[0]
+            dem_out_fn = os.path.splitext(source_dem)[0] + '_coreg-trans_source-DEM.tif'
+            if not os.path.exists(dem_out_fn):
+                out_prefix = os.path.splitext(source_dem)[0] + '_coreg'
+                alignment_wrapper_single(reference_dem_fn, source_dem, max_displacement=40, outprefix=out_prefix,
+                                         align='point-to-plane', trans_only=1, initial_align=None)
+            coregistered_list.append(dem_out_fn)
+
         else:
-            composite_prefix = 'triplet_'+'_'.join(np.unique(mdt1+mdt2))+'__'+'_'.join(np.unique(t1+t2))
+            # Restart with the largest remaining DEM
+            print('No overlapping DEMs, restarting with the largest')
+            tba_dem_areas = np.array([get_dem_area(dem_fn) for dem_fn in tba_dem_list])
+            imax = np.argwhere(tba_dem_areas==np.max(tba_dem_areas)).ravel()[0]
+            source_dem = tba_dem_list[imax]
+            reference_dem_fn = source_dem
+            coregistered_list.append(source_dem)
 
-        # produce bistereo pairwise mosaics
-        len_combinations = len(combination_out_list)
+        # Create an intermediate DEM from all coregistered DEMs using median statistic
+        dem_mos_fn = os.path.join(out_dir, 'mosaic_median.tif')
+        mosaic_dems(coregistered_list, dem_mos_fn, stat='median')
         
+        # Update reference DEM to intermediate DEM
+        tba_dem_list.remove(source_dem)
+        reference_dem_fn = dem_mos_fn
         
-        if len_combinations > 3:
-            # force tiled processing in case of multiview mosaicking
-            if not tile_size:
-                tile_size = 400
-        mos_log = p_map(asp.dem_mosaic,valid_dem_dir_list,combination_out_list,
-                ['None']*len_combinations,[None]*len_combinations,
-                [None]*len_combinations,[tile_size]*len_combinations)
+        pbar.update(1)
 
-        if len_combinations >= 1:
-            print("Producing triplet/multiview composites")
-            total_dem_list = list(itertools.chain.from_iterable(valid_dem_dir_list))
-            print(f"Mosaicing {len(total_dem_list)} DEM strips using median, wt_avg, count, nmad operators")
-            stats_list = [None,'median','nmad','count']
-            out_fn_list = [os.path.join(out_folder,
-                            '{}_{}_mos.tif'.format(composite_prefix,stat)) for stat in ['wt_avg','median','nmad','count']]
-            composite_mos_log = p_map(asp.dem_mosaic,[total_dem_list]*4,out_fn_list,['None']*4,[None]*4,stats_list,
-                                [tile_size]*4,num_cpus=4)            
-        out_log_fn = os.path.join(out_folder,'skysat_triplet_dem_mos.log')
-        print("Saving triplet DEM mosaic log at {}".format(out_log_fn))
-        with open(out_log_fn,'w') as f:
-            for log in mos_log+composite_mos_log:
-                f.write(log) 
-    if mode == 'video':
-        dir_list = sorted(glob.glob(os.path.join(dir,'1*/')))
-        valid_video_dir = []
-        for video_dir in dir_list:
-            try:
-                D_sub = iolib.fn_getma(os.path.join(video_dir,'run-D_sub.tif'),3)
-                stats = [np.percentile(D_sub.compressed(),(2,98)),np.mean(D_sub.compressed())]
-                DEM = glob.glob(os.path.join(video_dir,'run*{}*-DEM.tif'.format(identifier)))[0]
-                valid_video_dir.append(video_dir)
-            except:
-                continue 
-        video_dem_list = [glob.glob(os.path.join(dir,f'run*{identifier}*-DEM.tif'))[0] for dir in valid_video_dir]
-        stats_list = ['median','count','nmad']
-        print('total dems are {}'.format(len(video_dem_list)))
-        out_fn_list = [os.path.join(out_folder,'video_{}_mos.tif'.format(stat)) for stat in stats_list]
-        dem_mos_log = p_map(asp.dem_mosaic,[video_dem_list]*3,out_fn_list,['None']*3,[None]*3,stats_list,[None]*3) 
-        out_log_fn = os.path.join(out_folder,'skysat_video_dem_mos.log')
-        with open(out_log_fn,'w') as f:
-            for log in dem_mos_log:
-                f.write(log)
-        if filter_dem == 1:
-            print("Filtering DEM using NMAD and count metrics")
-            print(f"Filter will use min count of {min_video_count} and max NMAD of {max_video_nmad}")
-            mos_ds_list = warplib.memwarp_multi_fn(out_fn_list)
-            # Filtered array list contains dem_filtered,nmad_filtered, count_filtered in order
-            filtered_array_list = skysat.filter_video_dem_by_nmad(mos_ds_list,min_video_count,max_video_nmad)
-            trailing_str = f'_filt_max_nmad{max_video_nmad}_min_count{min_video_count}.tif'
-            out_filter_fn_list = [os.path.splitext(fn)[0]+trailing_str for fn in out_fn_list]
-            for idx,fn in enumerate(out_filter_fn_list):
-                iolib.writeGTiff(filtered_array_list[idx],fn,mos_ds_list[idx])
-                
+    pbar.close()
 
+    # Create NMAD and count mosaics
+    print('Creating NMAD and count mosaics')
+    nmad_mos_fn = os.path.join(out_dir, 'mosaic_nmad.tif')
+    out = mosaic_dems(coregistered_list, nmad_mos_fn, stat='nmad')
+    count_mos_fn = os.path.join(out_dir, 'mosaic_count.tif')
+    out = mosaic_dems(coregistered_list, count_mos_fn, stat='count')
+    
+    return dem_mos_fn, nmad_mos_fn, count_mos_fn
+
+
+def alignment_wrapper_single(ref_dem,source_dem,max_displacement,outprefix,
+                             align='point-to-plane',trans_only=0,initial_align=None,threads=iolib.cpu_count()):
+    if trans_only == 0:
+        trans_only = False
+    else:
+        trans_only = True
+    asp.dem_align(ref_dem, source_dem, max_displacement, outprefix, align,
+                  trans_only, threads=threads, initial_align=initial_align)
+
+
+def alignment_wrapper_multi(ref_dem,source_dem_list,max_displacement,align='point-to-plane',initial_align=None,
+                            trans_only=0):
+    outprefix_list=['{}_aligned_to{}'.format(os.path.splitext(source_dem)[0],os.path.splitext(os.path.basename(ref_dem))[0]) for source_dem in source_dem_list]
+    if trans_only == 0:
+        trans_only = False
+    else:
+        trans_only = True
+    n_source = len(source_dem_list)
+    
+    initial_align = [initial_align]*n_source
+    ref_dem_list=[ref_dem] * n_source
+    max_disp_list=[max_displacement] * n_source
+    align_list=[align] * n_source
+    trans_list=[trans_only] * n_source
+    p_umap(asp.dem_align,ref_dem_list,source_dem_list,max_disp_list,outprefix_list,
+           align_list,trans_list,[1]*n_source,initial_align,num_cpus = iolib.cpu_count())
+    
+def align_cameras_wrapper(input_camera_list,transform_txt,outfolder,rpc=0,dem='None',img_list=None):
+    n_cam=len(input_camera_list)
+    if (rpc == 1) & (dem != 'None'):
+        print("Will also write RPC files")
+        rpc = True
+    else:
+        dem = None
+        img_list = [None] * n_cam
+        rpc = False
+    transform_list = [transform_txt]*n_cam
+    outfolder = [outfolder] * n_cam
+    write = [True] * n_cam
+    rpc = [rpc] * n_cam
+    dem = [dem] * n_cam
+    
+    p_umap(asp.align_cameras,input_camera_list,transform_list,outfolder,write,rpc,dem,
+           img_list,num_cpus = iolib.cpu_count())
                 
                 
 def dense_match_wrapper(stereo_master_dir,ba_dir,modify_overlap=0,img_fol=None,orig_pickle=None,dense_match_pickle=None,stereo_dir=None,out_overlap_fn=None):
@@ -1198,10 +1338,29 @@ def dense_match_wrapper(stereo_master_dir,ba_dir,modify_overlap=0,img_fol=None,o
             out_overlap = os.path.join(ba_dir,out_overlap_fn)
         
         print("Saving adjusted overlap list at {}".format(out_overlap))
-        with open(out_overlap,'w') as foo:
+        with open(out_overlap,'w') as f:
             for idx,img1 in enumerate(new_img1):
                 out_str = '{} {}\n'.format(img1,new_img2[idx])
                 f.write(out_str)
                 
 
-            
+def add_cam_intrinsics(input_file, output_file, distortion_model='TSAI',
+                       intrinsics={'k1': -1e-12, 'k2': -1e-12, 'k3': -1e-12, 'p1': -1e-12, 'p2': -1e-12}):
+    # Read the .tsai file
+    with open(input_file, 'r') as file:
+        lines = file.readlines()
+    updated_lines = lines
+    # Remove NULL line
+    updated_lines = [line for line in updated_lines if line!='NULL\n']
+    # Add the distortion model
+    if f"{distortion_model}\n" not in updated_lines:
+        updated_lines.append(f"{distortion_model}\n")
+    # Add distortion parameters
+    for key in intrinsics.keys():
+        addition = f"{key} = {intrinsics[key]:.8f}\n"
+        if addition not in updated_lines:
+            updated_lines.append(addition)
+    # Save the updated file
+    with open(output_file, 'w') as file:
+        file.writelines(updated_lines)
+    # print('Saved updated camera file:', output_file)

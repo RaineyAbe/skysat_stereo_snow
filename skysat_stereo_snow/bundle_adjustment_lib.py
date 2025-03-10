@@ -14,8 +14,8 @@ def run_cmd(bin, args, **kw):
     # Note, need to add full executable
     # from dshean/vmap.py
     #binpath = os.path.join('/home/sbhushan/src/StereoPipeline/bin',bin)
-    #binpath = find_executable(bin)
-    binpath = '/nobackupp16/swbuild3/sbhusha1/StereoPipeline-3.1.1-alpha-2022-10-31-x86_64-Linux/bin/bundle_adjust'
+    binpath = find_executable(bin)
+    # binpath = '/nobackupp16/swbuild3/sbhusha1/StereoPipeline-3.1.1-alpha-2022-10-31-x86_64-Linux/bin/bundle_adjust'
     if binpath is None:
         msg = ("Unable to find executable %s\n"
         "Install ASP and ensure it is in your PATH env variable\n"
@@ -67,7 +67,7 @@ def get_ba_opts(ba_prefix, ip_per_tile=4000,camera_weight=None,translation_weigh
 
     if camera_weight is not None:
         # this generally assigns weight to penalise movement of camera parameters (Default:0)
-        ba_opt.extend(['--camera-weight', str(camera_weight)])
+        ba_opt.extend(['--camera-position-weight', str(camera_weight)])
     else:
         # this is more fine grained, will pinalize translation but allow rotation parameters update
         ba_opt.extend(['--translation-weight',str(translation_weight)])
@@ -158,11 +158,12 @@ def bundle_adjust_stable(img,ba_prefix,cam=None,session='rpc',initial_transform=
         if bound.crs is not geo_crs:
             bound = bound.to_crs(geo_crs)
         lon_min,lat_min,lon_max,lat_max = bound.total_bounds    
-    if camera_param2float == 'trans+rot':
-        cam_wt = 0
-    else:
-        # this will invoke adjustment with rotation weight of 0 and translation weight of 0.4
-        cam_wt = None
+    # if camera_param2float == 'trans+rot':
+    #     cam_wt = 0
+    # else:
+    #     # this will invoke adjustment with rotation weight of 0 and translation weight of 0.4
+    #     cam_wt = None
+    cam_wt=1000
     print(f"Camera weight is {cam_wt}")
     
     if dem:
