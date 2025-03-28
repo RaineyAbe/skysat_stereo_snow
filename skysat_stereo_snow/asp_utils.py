@@ -4,7 +4,7 @@ from pygeotools.lib import iolib,geolib,malib
 import os,sys,glob,shutil,psutil
 import pandas as pd
 import geopandas as gpd
-from pyproj import Proj, transform, Transformer
+from pyproj import transform, Transformer
 from rpcm import rpc_from_geotiff
 from distutils.spawn import find_executable
 import subprocess
@@ -110,7 +110,7 @@ def make_tsai(outfn,cu,cv,fu,fv,rot_mat,C,pitch):
     with open(outfn,'w') as f:
         f.write(out_str)
 
-def cam_gen(img,fl=553846.153846,cx=1280,cy=540,pitch=1,ht_datum=None,gcp_std=1,out_fn=None,out_gcp=None,datum='WGS84',refdem=None,camera=None,frame_index=None,distortion=False):
+def cam_gen(img,fl=553846.153846,cx=1280,cy=540,pitch=1,ht_datum=None,gcp_std=1,out_fn=None,out_gcp=None,datum='WGS84',refdem=None,camera=None,frame_index=None,threads=1):
         """
         function to initiate frame camera models from input rpc model or frame_index (skysat video)
         Theory: Uses camera resection principle to refine camera extrinsic from given ground control point (for rpc cameras as input, also generates initial camera extrinsic, which is then refined from tandard resection principle)
@@ -168,8 +168,8 @@ def cam_gen(img,fl=553846.153846,cx=1280,cy=540,pitch=1,ht_datum=None,gcp_std=1,
             cam_gen_opt.extend(['--frame-index',frame_index])
             cam_gen_opt.extend(['--parse-ecef'])
         cam_gen_opt.extend(['--refine-camera'])
-        if distortion:
-            cam_gen_opt.extent(['--refine-intrinsics','focal_length,distortion'])
+        if threads:
+            cam_gen_opt.extend(['--threads', str(threads)])
         cam_gen_args = [img]
         #print(cam_gen_opt+cam_gen_args)
         out = run_cmd('cam_gen',cam_gen_args+cam_gen_opt,msg='Running camgen command for image {}'.format(os.path.basename(img)))
@@ -306,7 +306,7 @@ def get_ba_opts(ba_prefix, camera_weight=0, overlap_list=None, overlap_limit=Non
         ba_opt.extend(['--elevation-limit',str(elevation_limit[0]),str(elevation_limit[1])])
     return ba_opt
 
-def mapproject(img,outfn,session='rpc',dem='WGS84',tr=None,t_srs='EPSG:4326',cam=None,ba_prefix=None,extent=None):
+def mapproject(img,outfn,session='rpc',dem='WGS84',tr=None,t_srs='EPSG:4326',cam=None,ba_prefix=None,extent=None,threads=1):
     """
     orthorectify input image over a given DEM using ASP's mapproject program.
     See mapproject documentation here: https://stereopipeline.readthedocs.io/en/latest/tools/mapproject.html
@@ -338,13 +338,13 @@ def mapproject(img,outfn,session='rpc',dem='WGS84',tr=None,t_srs='EPSG:4326',cam
     map_opt = []
     map_opt.extend(['-t',session])
     map_opt.extend(['--t_srs',t_srs])
-    map_opt.extend(['--threads', str(iolib.cpu_count())])
+    map_opt.extend(['--threads', str(threads)])
     if ba_prefix:
         map_opt.extend(['--bundle-adjust-prefix',ba_prefix])
-    if extent is not None:
+    if extent:
         xmin,ymin,xmax,ymax = extent.split(' ')
         map_opt.extend(['--t_projwin', xmin,ymin,xmax,ymax])
-    if tr is not None:
+    if tr:
         map_opt.extend(['--tr',tr])
 
     # for SkySat and Doves, limit to integer values, and 0 as no-data
@@ -745,7 +745,7 @@ def get_cam2rpc_opts(t='pinhole', dem=None, gsd=None, num_samples=50):
 
 def read_pc_align_transform(transformation):
     """
-    Read translation and rotation component from pc_aling 4x4 transformation matrix
+    Read translation and rotation component from pc_align 4x4 transformation matrix
 
     Parameters
     ----------

@@ -5,10 +5,9 @@ import shutil
 import subprocess
 import pandas as pd
 from tqdm import tqdm
-from p_tqdm import p_map
-import xdem
 import numpy as np
 import multiprocessing
+from skysat_stereo import asp_utils as asp
 
 def run_cmd(bin, args, **kw):
     """
@@ -43,203 +42,178 @@ def run_cmd(bin, args, **kw):
     return out
 
 
-def align_individual_dems(dem_list, refdem_fn, out_dir, max_displacement=40, tr=0.5):
-    """
-    Coregisters a list of DEMs to a reference DEM. For DEMs without at least 10% coverage of the reference DEM,
-    the function will create a median mosaic of the aligned DEMs and iteratively coregister remaining DEMs 
-    until no additional DEMs have sufficient overlap.
-    
-    Parameters
-    ----------  
-    dem_list: list
-        List of DEM file paths to be coregistered.
-    refdem_fn: str
-        File path to the reference DEM.
-    out_dir: str
-        Output directory for aligned DEMs.
-    max_displacement: int
-    tr: float
-        Resolution of the output DEMs.
-    
-    Returns
-    ----------
-    None
-    """
-    # Create output directory if it doesn't exist
-    if not os.path.exists(out_dir):
-        os.mkdir(out_dir)
-        
-    # Define function to get percent coverage of the reference DEM for a given DEM
-    def get_coverage(refdem, dem_fn):
-        dem = xdem.DEM(dem_fn, load_data=True)
-        ref = refdem.reproject(dem)
-        npx = np.where((dem.data.mask == False) & (ref.data.mask == False), 1, 0).sum()
-        return {"filename": dem_fn, "refdem_percent_coverage": npx / dem.data.size * 100}
+def align_images(overlap_pkl, cam_folder, out_folder, clean_up=False, threads=None):
+    # make output directory if it doesn't exist
+    if not os.path.exists(out_folder):
+        os.mkdir(out_folder)
+    # determine how many threads to use in processing
+    if not threads:
+        threads = multiprocessing.cpu_count()
+    # define function to get associated camera model
+    def get_camera_file(im_fn, cam_fol):
+        cam = glob.glob(os.path.join(cam_fol, os.path.splitext(os.path.basename(im_fn))[0].replace('_map','') + '*.tsai'))
+        if len(cam) > 0:
+            return cam[0]
+        else:
+            raise FileNotFoundError(f"Camera not found for image '{im_fn}'.\nCheck the input overlap file and camera folder.")
+    # load overlapping image pairs
+    overlap = pd.read_pickle(overlap_pkl)
+    # sort by descending overlap percentage
+    overlap.sort_values(by='overlap_perc', ascending=False, inplace=True)
+    overlap.reset_index(drop=True, inplace=True)
+    # Initialize list of aligned and unaligned images
+    im_list = set(list(overlap['img1'].values) + list(overlap['img2'].values))
+    im_align_list = []
+    im_unalign_list = im_list
+    # Start with most overlapping image pair
+    print('Starting with most overlapping image pair')
+    img1 = overlap.iloc[0]['img1']
+    cam1 = get_camera_file(img1, cam_folder)
+    overlap_im = overlap.loc[(overlap['img1']==img1) | (overlap['img2']==img1)]
+    overlap_im.reset_index(drop=True, inplace=True)
+    img2 = [x for x in overlap_im.iloc[0][['img1', 'img2']].values if x!=img1][0]
+    cam2 = get_camera_file(img2, cam_folder)
+    overlap_perc = overlap_im.iloc[0]['overlap_perc']
+    # copy img1 to aligned folder
+    shutil.copy(img1, os.path.join(out_folder, os.path.splitext(os.path.basename(img1))[0] + '_align.tif'))
+    shutil.copy(cam1, os.path.join(out_folder, os.path.splitext(os.path.basename(cam1))[0] + '_align.tif'))
+    # update aligned lists
+    im_align_list += [img1]
+    im_unalign_list = [x for x in im_list if x not in im_align_list]
+    # Start a progress bar
+    pbar = tqdm(total=len(im_unalign_list))
+    # while im_unalign_list:  
+    print(f'Aligning {os.path.basename(img2)} to {os.path.basename(img1)}.')
+    print(f'Overlap percent = {overlap_perc} %')
+    # Make folder for img2 alignment outputs
+    img2_folder = os.path.join(out_folder, os.path.basename(img2).split('_basic')[0])
+    if not os.path.exists(img2_folder):
+        os.mkdir(img2_folder)
+    # Define output files
+    output_prefix = os.path.join(img2_folder, 'run')
+    f = output_prefix + '-F.tif'
+    img2_align = os.path.join(img2_folder, os.path.splitext(os.path.basename(img2))[0] + '_align.tif')
+    img2_transform = output_prefix + '-transform.txt'
+    # Run stereo in correlator mode
+    if (not os.path.exists(f)) & (not os.path.exists(img2_align)):
+        print('Running image correlator...')
+        cmd = ['--correlator-mode', 
+                '--stereo-algorithm', 'asp_mgm', 
+                '--subpixel-mode', '3', 
+                '--threads', str(threads),
+                img1, img2, output_prefix]
+        out = run_cmd('parallel_stereo', cmd)
+        print(out)
+    # Run image_align using the filtered disparity map
+    if not os.path.exists(img2_align):
+        print('Aligning image...')
+        cmd = [img1, img2, 
+                '--output-image', img2_align,
+                '--output-prefix', output_prefix,
+                '--alignment-transform', 'rigid',
+                '--ecef-transform-type', 'rigid',
+                '--dem1', img1,
+                '--dem2', img2,
+                '--disparity-params', f + " 1000000",
+                '--threads', str(threads)]
+        out = run_cmd('image_align', cmd)
+        print(out)
+    # Apply the transform to img2 camera
+    print('Aligning camera...')
+    cmd = [img1, img2, cam1, cam2,
+           '--initial-transform', img2_transform,
+           '--apply-initial-transform-only', 
+           '-o', output_prefix]
+    out = run_cmd('bundle_adjust', cmd)
+    print(out)
+    # update list of aligned and unaligned images
+    im_align_list += [img2]
+    im_unalign_list = [x for x in im_list if x not in im_align_list]
+    # update progress bar
+    pbar.update(1)
+    # Determine which image pair to align next
+    overlap_remaining = overlap[
+        (overlap['img1'].isin(im_align_list) & overlap['img2'].isin(im_unalign_list)) |
+        (overlap['img2'].isin(im_align_list) & overlap['img1'].isin(im_unalign_list))
+    ]
+    if overlap_remaining.empty:
+        print("No more overlapping images to align.")
+        # break
+    # Select the next image pair with the highest overlap
+    overlap_remaining = overlap_remaining.sort_values(by='overlap_perc', ascending=False).reset_index(drop=True)
+    next_row = overlap_remaining.iloc[0]
+    # make sure the aligned image is set to img1, unaligned image is set to img2
+    if next_row['img1'] in im_align_list:
+        img1 = next_row['img1']
+        img2 = next_row['img2']
+    else:
+        img1 = next_row['img2']
+        img2 = next_row['img1']
+    # get the associated cameras
+    cam1 = get_camera_file(img1, cam_folder)
+    cam2 = get_camera_file(img2, cam_folder)
+    # get overlap percentage of next alignment image pair for printing
+    overlap_perc = next_row['overlap_perc']
 
-    # Define function to align a DEM to the reference DEM
-    def align_dem(dem_fn, refdem_fn, out_dir, max_displacement=40, threads=4, tr=0.5, output_prefix=None):
-        if output_prefix is None:
-            output_prefix = os.path.join(out_dir, os.path.split(os.path.dirname(dem_fn))[1] + '-run')
-        align_out_fn = output_prefix + '-trans_source.tif'
-        grid_out_fn = output_prefix + '-trans_source-DEM.tif'
-        if not os.path.exists(align_out_fn):
-            align_cmd = ['--max-displacement', str(max_displacement), '--threads', str(threads),
-                         '--highest-accuracy', '--save-transformed-source-points', '-o', output_prefix,
-                         refdem_fn, dem_fn]
-            run_cmd('pc_align', align_cmd)
-        if os.path.exists(align_out_fn) and not os.path.exists(grid_out_fn):
-            grid_cmd = ['--tr', str(tr), align_out_fn]
-            run_cmd('point2dem', grid_cmd)
-    
-    # Define function to create median mosaic of a list of DEMs
-    def create_median_mosaic(dem_list, out_fn):
-        mosaic_cmd = dem_list + ['--median', '--tr', str(tr), '-o', out_fn]
-        run_cmd('dem_mosaic', mosaic_cmd)
 
-    # Calculate percent coverage of the reference DEM for each DEM
-    print('Calculating percent coverage of the reference DEM for each DEM')
-    refdem = xdem.DEM(refdem_fn, load_data=True)
-    coverage_data = p_map(lambda x: get_coverage(refdem, x), dem_list, num_cpus=int(multiprocessing.cpu_count()/2))
-    coverage_df = pd.DataFrame(coverage_data)
-    
-    # ROUND 1: Coregister DEMs with at least 10% overlap to the reference DEM
-    dem_align_list = coverage_df[coverage_df['refdem_percent_coverage'] >= 10]['filename'].tolist()
-    if not dem_align_list:
-        print("No DEMs with at least 10% coverage of the reference DEM.")
-        return
-    print(f'Number of DEMs with reference DEM coverage >= 10%: {len(dem_align_list)}')
-    for dem_fn in tqdm(dem_align_list):
-        align_dem(dem_fn, refdem_fn, out_dir, max_displacement=max_displacement, threads=multiprocessing.cpu_count())
-    # Create median mosaic of aligned DEMs
-    mosaic_fn = os.path.join(out_dir, 'aligned_dem_mosaic.tif')
-    print(f'Creating median mosaic of {len(dem_align_list)} aligned DEMs')
-    create_median_mosaic(dem_align_list, mosaic_fn)
-    
-    # ROUND 2+: Coregister the remaining DEMs to the median mosaic of the aligned DEMs
-    remaining_dems = [x for x in dem_list if x not in dem_align_list]
-    while remaining_dems:        
-        # Check which remaining DEMs have at least 10% coverage of the new median mosaic
-        mosaic = xdem.DEM(mosaic_fn, load_data=True)
-        coverage_data = p_map(lambda x: get_coverage(mosaic, x), remaining_dems, num_cpus=int(multiprocessing.cpu_count()/2))
-        coverage_df = pd.DataFrame(coverage_data)
-        new_align_list = coverage_df[coverage_df['refdem_percent_coverage'] >= 10]['filename'].tolist()
-        if not new_align_list:
-            print("No additional DEMs with at least 10% coverage of the median mosaic. Stopping.")
-            break
-        print(f'Number of additional DEMs with median mosaic coverage >= 10%: {len(new_align_list)}')
-        # Coregister the new DEMs
-        for dem_fn in tqdm(new_align_list):
-            align_dem(dem_fn, mosaic_fn, out_dir, max_displacement=max_displacement, threads=multiprocessing.cpu_count())
-        # Update the list of aligned and remaining DEMs
-        dem_align_list.extend(new_align_list)
-        remaining_dems = [x for x in remaining_dems if x not in dem_align_list]
+out_fol = '/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out'
+im_fol = os.path.join(out_fol, 'init_rpc_ortho')
+cam_fol = os.path.join(out_fol, 'camgen_cam_gcp')
+im_align_fol = os.path.join(out_fol, 'init_image_alignment')
+overlap_stereo_pkl = os.path.join(im_align_fol, 'overlap_with_overlap_perc_stereo_only.pkl')
 
-        # Create new median mosaic of all aligned DEMs
-        final_mosaic_fn = os.path.join(out_dir, 'aligned_dem_mosaic.tif')
-        print(f'Creating new median mosaic of {len(dem_align_list)} aligned DEMs')
-        create_median_mosaic(dem_align_list, final_mosaic_fn)
-    
-    print("Coregistration process complete!")
+align_images(overlap_stereo_pkl, cam_fol, im_align_fol)
 
-    
-out_dir = '/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out'
-dem_files = sorted(glob.glob(os.path.join(out_dir, 'final_pinhole_stereo', '20*', '20*', '*-DEM.tif')))
-refdem_fn = os.path.join(out_dir, 'refdem', 'MCS_refdem_lidar_COPDEM_merged_shpclip_trim_stable.tif')
-align_dir = os.path.join(out_dir, 'aligned_dems')
+# IMG1=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/SkySatScene/20241003_221111_ssc9d2_0012_basic_panchromatic.tif
+# IMG2=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20241003/SkySatScene/20241003_221037_ssc9d2_0014_basic_panchromatic.tif
+# MATCH_FILE=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_image_alignment/20240420_165822_ssc16d3_0011/run-20240420_165753_ssc16d3_0014_basic_panchromatic_map__20240420_165822_ssc16d3_0011_basic_panchromatic_map-clean.match
 
-align_individual_dems(dem_files, refdem_fn, align_dir)
+# pc_align                                     \
+# $IMG1 $IMG2                            \
+# --max-displacement 100 \
+# -o /bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_image_alignment/20240420_165822_ssc16d3_0011/run
 
-# def align_individual_dems(dem_files, out_dir):
-#     # Check if output directory exists
-#     if not os.path.exists(out_dir):
-#         os.mkdir(out_dir)
-        
-#     # Create a GeoDataFrame with DEM file names and bounding boxes
-#     with rio.open(dem_files[0]) as src:
-#         crs = f"EPSG:{src.crs.to_epsg()}"
-#     def get_bbox(dem_path):
-#         with rio.open(dem_path) as src:
-#             return box(*src.bounds)
-#     dem_gdf = gpd.GeoDataFrame({"filename": dem_files, "geometry": [get_bbox(f) for f in dem_files]}, crs=crs)
-#     dem_gdf['area'] = [geom.area for geom in dem_gdf['geometry']]
+# bundle_adjust \
+# /bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_rpc_ortho/20240420_165753_ssc16d3_0014_basic_panchromatic_map.tif \
+# /bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_rpc_ortho/20240420_165822_ssc16d3_0011_basic_panchromatic_map.tif \
+# /bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/camgen_cam_gcp/20240420_165753_ssc16d3_0014_basic_panchromatic_rpc.tsai \
+# /bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/camgen_cam_gcp/20240420_165822_ssc16d3_0011_basic_panchromatic_rpc.tsai \
+# --initial-transform /bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_image_alignment/20240420_165822_ssc16d3_0011/run-transform.txt \
+# --apply-initial-transform-only \
+# -o /bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_image_alignment/20240420_165822_ssc16d3_0011/run
 
-#     # Initialize DEM sets
-#     iteration = 1
-#     remaining_dems = list(dem_files)
-#     aligned_dems = []
-    
-#     # Identify the largest DEM
-#     dem_gdf.sort_values(by='area', ascending=False, inplace=True)
-#     dem_largest = dem_gdf.iloc[0]['filename']
-    
-#     # Set the largest DEM as the initial reference DEM
-#     refdem = dem_largest
-#     remaining_dems = [x for x in remaining_dems if x!=refdem]
-#     aligned_dems.append(refdem)
-    
-#     # Initialize progress bar
-#     pbar = tqdm(total=len(remaining_dems), desc="Coregistering DEMs", unit="DEM")
-    
-#     # Create a separate function to compute overlaps with new reference DEMs
-#     def get_updated_overlap_df(refdem, dem_gdf):
-#         # Get reference DEM bounding box
-#         with rio.open(refdem) as src:
-#             ref_bbox = box(*src.bounds)
-#         # Recalculate overlap data for the current refdem
-#         new_overlap_data = []
-#         for i in range(len(dem_gdf)):
-#             row = dem_gdf.iloc[i]
-#             if ref_bbox.intersects(row.geometry):
-#                 intersection = ref_bbox.intersection(row.geometry).area
-#                 min_area = min(ref_bbox.area, row.geometry.area)
-#                 percent_overlap = (intersection / min_area) * 100
-#                 new_overlap_data.append({"dem1": refdem, "dem2": row.filename, "percent_overlap": percent_overlap})
-#         return pd.DataFrame(new_overlap_data)
+# IMG1=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/SkySatScene/20241003_221111_ssc9d2_0012_basic_panchromatic.tif
+# IMG2=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20241003/SkySatScene/20241003_221037_ssc9d2_0014_basic_panchromatic.tif
+# CAM1=
 
-#     # Begin alignment in batches
-#     while remaining_dems:
-#         print(f"\nIteration {iteration}: Coregistering next batch of DEMs")        
-        
-#         # Identify DEMs overlapping the reference DEM
-#         overlap_df = get_updated_overlap_df(refdem, dem_gdf)
-#         if overlap_df.empty:
-#             print("No overlapping DEMs found.")
-#             break
-        
-#         # Identify DEMs to be aligned
-#         overlap_df = overlap_df[overlap_df['dem2'].isin(remaining_dems)]
-#         if overlap_df.empty:
-#             print("No overlapping DEMs found.")
-#             break
-        
-#         # Sort overlap df by percent overlap and select the top 3
-#         overlap_df = overlap_df.sort_values(by='percent_overlap', ascending=False).head(3)
-#         dem_align_list = overlap_df['dem2'].tolist()
-#         if len(dem_align_list) < 1:
-#             print("No more overlapping DEMs found.")
-#             break
-        
-#         # Coregister the batch
-#         output_prefix = os.path.join(out_dir, f'run{iteration}')
-#         align_cmd = dem_align_list + [refdem] + ['--save-transformed-clouds', '-o', output_prefix]
-#         print('n_align command:', align_cmd)
-#         run_cmd('n_align', align_cmd)
-        
-#         # Update progress bar and DEM sets
-#         pbar.update(len(dem_align_list))
-#         aligned_dems.extend(dem_align_list)
-#         remaining_dems = [x for x in remaining_dems if x not in dem_align_list]
-        
-#         # Create median mosaic of the aligned DEMs
-#         mosaic_output = os.path.join(out_dir, f'run{iteration}_mosaic.tif')
-#         mosaic_cmd = list(aligned_dems) + ['--median', '-o', mosaic_output]
-#         print('dem_mosaic command:', mosaic_cmd)
-#         run_cmd('dem_mosaic', mosaic_cmd)
-        
-#         # Update reference DEM to the new mosaic
-#         refdem = mosaic_output
-        
-#         iteration += 1
-    
-#     pbar.close()
-#     print("Coregistration complete!")
+# bundle_adjust $IMG1 $IMG2 left.xml right.xml \
+#   --initial-transform align/run-transform.txt       \
+#   --apply-initial-transform-only -o ba_align/run
+
+# IMG1=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/SkySatScene/20241003_221111_ssc9d2_0012_basic_panchromatic.tif
+# IMG2=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20241003/SkySatScene/20241003_221037_ssc9d2_0014_basic_panchromatic.tif
+# OUTPUT_IMAGE=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20241003/proc_out/image_align_test/20241003_221111_ssc9d2_0012/20241003_221037_ssc9d2_0014_basic_panchromatic_align.tif
+# OUTPUT_PREFIX=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20241003/proc_out/init_image_alignment/20241003_221111_ssc9d2_0012/run
+# F=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20241003/proc_out/init_image_alignment/20241003_221111_ssc9d2_0012/run-F.tif
+
+# image_align $IMG1 $IMG2 \
+# --output-image $OUTPUT_IMAGE \
+# --output-prefix $OUTPUT_PREFIX \
+# --alignment-transform rigid \
+# --ecef-transform-type rigid \
+# --dem1 $IMG1 \
+# --dem2 $IMG2 \
+# --disparity-params "$F 1000000"
+
+# IMG=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_rpc_ortho/20240420_165822_ssc16d3_0012_basic_panchromatic_map.tif
+# CAM=/bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_rpc_ortho/20240420_165822_ssc16d3_0012_basic_panchromatic_map_RPC.TXT
+# PITCH=0.8
+# FL=553846.153846
+# CX=1280
+# CY=540
+
+# cam_gen $IMG \
+# --input-camera $CAM \
+# --focal-length $FL \
+# --pixel-pitch $PITCH \
+# -o /bsuhome/raineyaberle/scratch/SkySat-Stereo/study-sites/MCS/20240420/proc_out/init_rpc_ortho/20240420_165822_ssc16d3_0012_basic_panchromatic_map.tsai

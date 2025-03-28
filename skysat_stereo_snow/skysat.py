@@ -634,9 +634,9 @@ def prepare_stereo_jobs_wrapper(img1,img2,img_list,outfolder,t,threads=2,crop_ma
         ep = 5
             
     # Prepare stereo options
-    stereo_opt = asp_utils.get_stereo_opts(session=t,ep = ep, threads=threads,ba_prefix=ba,
-        align=align,corr_kernel=corr_kernel,lv=lv,rfne_kernel=rfne_kernel,stereo_mode=stereo_mode,
-        spm=spm,cost_mode=cost_mode,corr_tile_size=corr_tile_size,xcorr=xcorr)
+    stereo_opt = asp_utils.get_stereo_opts(session=t, ep=ep, threads=threads, ba_prefix=ba,
+        align=align, corr_kernel=corr_kernel, lv=lv, rfne_kernel=rfne_kernel, stereo_mode=stereo_mode,
+        spm=spm, cost_mode=cost_mode, corr_tile_size=corr_tile_size, xcorr=xcorr)
     #print(stereo_opt) 
     return stereo_opt + stereo_args
 
@@ -703,7 +703,7 @@ def triplet_stereo_job_list(overlap_list,t,img_list,threads=4,ba_prefix=None,cam
     return list(itertools.chain.from_iterable(job_list))
    
 
-def prep_trip_df(overlap_list, true_stereo=True,cross_track=False):
+def prep_trip_df(overlap_list, true_stereo=True, cross_track=False):
     """
     Prepare dataframe from input plckle file containing overlapping images with percentages
     Parameters
