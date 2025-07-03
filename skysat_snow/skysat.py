@@ -1,15 +1,15 @@
 #! /usr/bin/env python
 
-from pygeotools.lib import iolib,geolib,warplib,malib
+# from pygeotools.lib import iolib,geolib,warplib,malib
 from shapely.geometry import Polygon, Point
 import geopandas as gpd
-from skysat_stereo import asp_utils
+from skysat_stereo_snow import asp_utils
 import numpy as np
 import pandas as pd
-from osgeo import gdal
+# from osgeo import gdal
 import os,sys,glob
 from shapely import wkt
-from osgeo import gdalconst
+# from osgeo import gdalconst
 import re
 from tqdm import tqdm
 from datetime import datetime
@@ -679,7 +679,7 @@ def triplet_stereo_job_list(overlap_list,t,img_list,threads=4,ba_prefix=None,cam
     """
 
     job_list = []
-    print(img_list)
+    # print(img_list)
     l_img_list = []
     r_img_list = []
     triplet_df = prep_trip_df(overlap_list,cross_track=cross_track)
@@ -697,8 +697,6 @@ def triplet_stereo_job_list(overlap_list,t,img_list,threads=4,ba_prefix=None,cam
             [cam_fol]*num_img,[dem]*num_img,[block]*num_img,[texture]*num_img,[entry_point]*num_img)
         # print(type(job_list_))
         job_list.append(job_list_)
-
-     
     
     return list(itertools.chain.from_iterable(job_list))
    
@@ -742,7 +740,7 @@ def prep_trip_df(overlap_list, true_stereo=True, cross_track=False):
             df = df[df['sat1'] == df['sat2']]
     # filter to overlap percentage of around 5%
     df['overlap_perc'] = df['overlap_perc'] * 100
-    df = df[(df['overlap_perc'] > 2)]
+    df = df[(df['overlap_perc'] > 5)]
     df['identifier_text'] = df['date1'] + '_' + df['time1'] + '_' + df['date2'] + '_' + df['time2']
     print("Number of pairs over which stereo will be attempted are {}".format(len(df)))
     return df

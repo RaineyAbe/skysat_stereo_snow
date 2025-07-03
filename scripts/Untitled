@@ -1,8 +1,0 @@
-
-refdem="/Volumes/LaCie/raineyaberle/Research/PhD/Skysat-Stereo/study-sites/Banner/refdem/Banner_COPDEM_clip_buffer_30km_WGS84_ellipsoid_UTM.tif"
-refdem_filled="/Volumes/LaCie/raineyaberle/Research/PhD/Skysat-Stereo/study-sites/Banner/refdem/Banner_COPDEM_clip_buffer_30km_WGS84_ellipsoid_UTM_filled.tif"
-refdem_filled_resamp="/Volumes/LaCie/raineyaberle/Research/PhD/Skysat-Stereo/study-sites/Banner/refdem/Banner_COPDEM_clip_buffer_30km_WGS84_ellipsoid_UTM_filled_100m.tif"
-
-gdal_fillnodata.py -md 10 -b 1 -of GTiff $refdem $refdem_filled
-
-gdalwarp -tr 100 100 -of GTiff $refdem_filled $refdem_filled_resamp

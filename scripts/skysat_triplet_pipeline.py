@@ -3,7 +3,12 @@ import argparse
 from datetime import datetime
 import os,sys,glob
 import numpy as np
-from skysat_stereo import skysat_stereo_workflow as workflow
+
+# add path to workflow functions
+import sys
+utils_path = "/Users/raineyaberle/Research/PhD/SnowDEMs/skysat_stereo_snow/skysat_stereo_snow"
+sys.path.append(utils_path)
+import skysat_stereo_workflow as workflow
 
 """
 Script for running the full pipeline based on workflow slightly modified from the ISPRS 2020 submission

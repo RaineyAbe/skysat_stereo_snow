@@ -1,18 +1,19 @@
 #! /usr/bin/env python
 
 import os,sys,glob,re,shutil
+from pathlib import Path
 import numpy as np
 import geopandas as gpd
 import pandas as pd
-from pygeotools.lib import iolib,malib
 from tqdm import tqdm
 from p_tqdm import p_umap, p_map
-from skysat_stereo import skysat
-from skysat_stereo import asp_utils as asp
-from rpcm import geo
-from skysat_stereo import misc_geospatial as misc
+# from skysat_stereo_snow import skysat
+# from skysat_stereo_snow import asp_utils as asp
+# from rpcm import geo
+# from skysat_stereo_snow import misc_geospatial as misc
 import subprocess
 from shapely.geometry import Polygon
+from shapely.ops import unary_union
 import itertools
 from pyproj import Transformer
 import xarray as xr
@@ -40,14 +41,8 @@ def run_cmd(bin, args, **kw):
         log (stdout) as str if the command executed, error message if the command failed
     """
     #Note, need to add full executable
-    # binpath = '/Users/raineyaberle/Research/PhD/SnowDEMs/StereoPipeline-3.5.0-alpha-2024-10-05-x86_64-OSX/bin/' + bin
-    binpath = shutil.which(bin)
-    # print(binpath)
-    if binpath is None:
-        msg = ("Unable to find executable %s\n"
-        "Install ASP and ensure it is in your PATH env variable\n"
-       "https://ti.arc.nasa.gov/tech/asr/intelligent-robotics/ngt/stereo/" % bin)
-        sys.exit(msg)
+    binpath = "/Users/raineyaberle/Research/PhD/SnowDEMs/StereoPipeline-3.5.0-alpha-2024-10-05-x86_64-OSX/bin/" + bin
+    # binpath = shutil.which(bin)
     call = [binpath,]
     if args is not None: 
         call.extend(args)
@@ -56,6 +51,28 @@ def run_cmd(bin, args, **kw):
     except:
         out = "the command {} failed to run, see corresponding asp log".format(call)
     return out
+
+
+def setup_parallel_jobs(total_jobs: int):
+    # Get total CPU count
+    total_cpus = multiprocessing.cpu_count()
+
+    # Determine how many jobs per CPU
+    if total_jobs <= 1:
+        njobs = 1
+    elif total_jobs <= 10:
+        njobs = min(2, total_jobs)
+    elif total_jobs <= 100:
+        njobs = min(4, total_jobs)
+    else:
+        njobs = min(4, total_jobs)
+
+    # Detemrine how many threads per job
+    threads_per_job = max(1, total_cpus // njobs)
+
+    print(f"Will run {total_jobs} jobs across {njobs} CPU with {threads_per_job} threads per CPU")
+
+    return njobs, threads_per_job
 
 
 def convert_wgs_to_utm(lon: float, lat: float):
@@ -74,7 +91,7 @@ def convert_wgs_to_utm(lon: float, lat: float):
     epsg_code: str
         optimal UTM zone, e.g. "EPSG:32606"
     """
-    utm_band = str((np.floor((lon + 180) / 6) % 60) + 1)
+    utm_band = str(int((np.floor((lon + 180) / 6) % 60) + 1))
     if len(utm_band) == 1:
         utm_band = '0' + utm_band
     if lat >= 0:
@@ -115,21 +132,24 @@ def calculate_image_bounds(img_folder, out_folder):
     bound_fn = os.path.join(out_folder, 'image_bounds.gpkg')
     bound_buffer_fn = os.path.join(out_folder, 'image_bounds_buffer1km.gpkg')
 
-    # Get list of image bounds
+    # Get list of image bounds polygons
+    def get_image_bounds(im_fn):
+        bounds = gu.Raster(im_fn).bounds
+        bounds_poly = Polygon([[bounds.left, bounds.bottom], [bounds.right, bounds.bottom],
+                               [bounds.right, bounds.top], [bounds.left, bounds.top],
+                               [bounds.left, bounds.bottom]])
+        return bounds_poly
     n_proc = multiprocessing.cpu_count()
-    shp_list = p_map(skysat.skysat_footprint,img_list,num_cpus=n_proc)    
+    poly_list = p_map(get_image_bounds,img_list,num_cpus=n_proc)    
     
-    # Merge image bounds
-    merged_shape = misc.shp_merger(shp_list)
-    bbox = merged_shape.total_bounds
-    print(f'Bounding box lon_lat is:{bbox}')
+    # Merge image polygons
+    bounds_poly = unary_union(poly_list)
 
     # Solve for optimal UTM zone
-    utm_epsg = convert_wgs_to_utm(bbox[0], bbox[1])
+    utm_epsg = convert_wgs_to_utm(*bounds_poly.centroid)
     
     # Convert to GeoDataFrame
-    bound_poly = Polygon([[bbox[0],bbox[3]], [bbox[2],bbox[3]], [bbox[2],bbox[1]], [bbox[0],bbox[1]]])
-    bound_shp = gpd.GeoDataFrame(index=[0], geometry=[bound_poly], crs=utm_epsg)
+    bound_shp = gpd.GeoDataFrame(index=[0], geometry=[bounds_poly], crs=utm_epsg)
     # buffer by 1km
     bound_buffer_shp = bound_shp.buffer(1e3)
     
@@ -183,7 +203,6 @@ def identify_overlapping_image_pairs(img_folder, tcrs, out_folder, overlap_perc=
     except:
         raise Exception("No images found in the directory. Check path and make sure they end with a '.tif' or '.tiff' extension")
 
-
     # Identify possible combinations
     img_combinations = list(itertools.combinations(img_list,2))
     n_comb = len(img_combinations)
@@ -217,9 +236,82 @@ def identify_overlapping_image_pairs(img_folder, tcrs, out_folder, overlap_perc=
     
     return out_stereo_pkl, out_stereo_txt
 
+    
+def setup_parallel_jobs(total_jobs: int):
+    """
+    Determine the number of parallel jobs to run and threads per job.
 
-def skysat_preprocess(img_folder, frame_index=None, product_level='l1a', overlap_pkl=None,
-                      dem_fn=None, out_folder=None):
+    Parameters
+    ----------
+    total_jobs: int
+        The total number of jobs to run (e.g., number of stereo pairs).
+
+    Returns
+    -------
+    njobs: int
+        Number of parallel processes to run.
+    threads_per_job: int
+        Number of threads to allocate per process.
+    """
+    total_cpus = multiprocessing.cpu_count()
+
+    if total_jobs <= 1:
+        njobs = 1
+    elif total_jobs <= 10:
+        njobs = min(2, total_jobs)
+    elif total_jobs <= 100:
+        njobs = min(4, total_jobs)
+    else:
+        njobs = min(4, total_jobs)
+
+    threads_per_job = max(1, total_cpus // njobs)
+
+    print(f"Will run {len(total_jobs)} jobs across {njobs} CPU with {threads_per_job} threads per CPU")
+
+    return njobs, threads_per_job
+
+
+def find_matching_camera_files(image_fn, cam_folder):
+    """
+    Find camera file matching the image file's unique identifier.
+    Parameters
+    ----------
+    image_fn: str
+        file name of the image
+    cam_folder: str
+        folder containing camera files
+    Returns
+    ----------
+    matched_fn: str
+        file name of the matching camera file
+    """
+    # Get the identifying string from the image file
+    # File naming convention SkySatScenes (https://developers.planet.com/docs/data/skysat/): 
+    # <acquisition date>_<acquisition time>_<satellite_id><camera_id>_<frame_id>_<bandProduct>
+    match = re.search(r"\d{8}_\d{6}_[a-zA-Z0-9]+_\d{4}", image_fn)
+    if match:
+        identifier = match.group(0)
+    else:
+        identifier = None
+    if not identifier:
+        raise ValueError(f"Could not extract identifier from image filename: {image_fn}")
+    
+    # Find matching camera file(s)
+    cam_list = (glob.glob(os.path.join(cam_folder, "*.tsai")) 
+                + glob.glob(os.path.join(cam_folder, '*.TXT')))
+    matched_fn = [f for f in cam_list if identifier in f]
+    # ideally, only one match, otherwise it's ambiguous
+    if len(matched_fn) == 0:
+        raise ValueError(f"No matching camera file found for image: {image_fn}")
+    elif len(matched_fn) > 1:
+        raise ValueError(f"Multiple matching camera files found for image: {image_fn}")
+    else:
+        matched_fn = matched_fn[0]
+
+    return matched_fn
+
+
+def skysat_preprocess(img_list, product_level='l1a', dem_fn=None, out_folder=None):
     """
     Resection and construct pinhole cameras for all images in the input folder. 
 
@@ -241,53 +333,75 @@ def skysat_preprocess(img_folder, frame_index=None, product_level='l1a', overlap
     cam_gen_log: log
         log of the cam_gen command
     """
-    # make output directory if it doesn't exist
+    # Make output directory if it doesn't exist
     if not os.path.exists(out_folder):
         os.mkdir(out_folder)
     
     # Read overlap data table
-    df = pd.read_pickle(overlap_pkl)
-    img_list = list(np.unique(np.array(list(df.img1.values)+list(df.img2.values))))
-    img_list = [os.path.splitext(os.path.basename(img))[0] for img in img_list]
-    cam_list = [glob.glob(os.path.join(img_folder,'{}*.tif'.format(img)))[0] for img in img_list]
-    n = len(img_list)
+    cam_list = img_list
 
-    # Set up camera specs
-    if product_level == 'l1b':
-        pitch = [0.8]*n
-    else:
-        pitch = [1.0]*n
-    out_fn = [os.path.join(out_folder,'{}_rpc.tsai'.format(frame)) for frame in img_list]
-    out_gcp = [os.path.join(out_folder,'{}_rpc.gcp'.format(frame)) for frame in img_list]
-    camera = cam_list
-    frame_index = [None]*n
-    img_list = cam_list
-    gcp_factor = 8
-    fl = [553846.153846]*n
-    cx = [1280]*n
-    cy = [540]*n
-    gcp_std = [1]*n
-    datum = ['WGS84']*n
-    refdem = [dem_fn]*n
-    ht_datum = [np.nanmedian(iolib.fn_getma(dem_fn).data)]*n # use this value for height where DEM has no-data
+    # Define output camera and GCP files
+    out_fn_list = [os.path.join(out_folder,'{}_rpc.tsai'.format(frame)) for frame in img_list]
+    out_gcp_list = [os.path.join(out_folder,'{}_rpc.gcp'.format(frame)) for frame in img_list]
+
+    # Define reference height value where DEM has no data
+    ht_datum = np.nanmedian(xdem.DEM(dem_fn).data) 
 
     # Determine number of jobs and threads per job
-    ncpu = multiprocessing.cpu_count()
-    njobs = 4
-    threads_per_job = int(np.floor(ncpu/njobs))
-    threads_list = [str(threads_per_job)]*n
-    print(f"Running across {njobs} CPU with {threads_per_job} threads per CPU")
+    ncpu, threads_per_job = setup_parallel_jobs(total_jobs=len(img_list))
     
-    # Run cam_gen
-    print("Starting camera resection procedure")
-    cam_gen_log = p_map(asp.cam_gen, img_list, fl, cx, cy, pitch, ht_datum, gcp_std, out_fn, out_gcp,
-                        datum, refdem, camera, frame_index, threads_list, num_cpus=njobs)
-    print(cam_gen_log[0])
-    print("writing gcp with basename removed")
-    # count expexted gcp 
-    print(f"Total expected GCP {gcp_factor*n}")    
-    asp.clean_gcp(out_gcp, out_folder)
+    # Set up cam_gen options
+    cam_gen_opt = []
+    cam_gen_opt.extend(['--focal-length', str(553846.153846)])
+    cam_gen_opt.extend(['--optical-center', str(1280), str(540)])
+    if product_level=='l1b':
+        cam_gen_opt.extend(['--pixel-pitch', str(0.8)])
+    else:
+        cam_gen_opt.extend(['--pixel-pitch', str(1.0)])
+    cam_gen_opt.extend(['--height-above-datum',str(ht_datum)])
+    cam_gen_opt.extend(['--gcp-std', str(1)])
+    cam_gen_opt.extend(['--datum', 'WGS84'])
+    cam_gen_opt.extend(['--reference-dem', dem_fn])
+    cam_gen_opt.extend(['--height-above-datum',str(ht_datum)])
+    cam_gen_opt.extend(['--refine-camera'])
+    cam_gen_opt.extend(['--threads', threads_per_job])
+
+    # Construct jobs list
+    jobs_list = []
+    for img, cam, out_fn, out_gcp in zip(img_list, cam_list, out_fn_list, out_gcp_list):
+        job = cam_gen_opt
+        job.extend(['--input-camera', cam])
+        job.extend(['-o', out_fn])
+        job.extend(['--gcp-file', out_gcp])
+        job.extend([img])
+        jobs_list.append(job)
+
+    # Run cam_gen in parallel
+    cam_gen_logs = p_map(run_cmd, ['cam_gen']*len(jobs_list), jobs_list, num_cpus=ncpu)
+
+    # Save compiled cam_gen log
+    cam_gen_log = os.path.join(out_folder, 'cam_gen.log')
+    print("Saving cam_gen log at {}".format(cam_gen_log))
+    with open(cam_gen_log,'w') as f:
+        for log in cam_gen_logs:
+            f.write(log)
     
+    # Remove basename from GCP file names
+    # ASP's cam_gen writes full path for images in the GCP files. This does not play well during bundle adjustment.
+    # The function returns a consolidated gcp file with all images paths only containing basenames so that bundle adjustment can roll along
+    # See ASP's gcp logic here: https://stereopipeline.readthedocs.io/en/latest/tools/bundle_adjust.html#bagcp
+    print("writing gcp with basename removed")  
+    df_list = [pd.read_csv(x,header=None,delimiter=r"\s+") for x in out_gcp]
+    gcp_df = pd.concat(df_list, ignore_index=True)
+    def clean_img_in_gcp(row):
+        return os.path.basename(row[7])
+    gcp_df[7] = gcp_df.apply(clean_img_in_gcp, axis=1)
+    gcp_df[0] = np.arange(len(gcp_df))
+    print(f"Total number of GCPs found {len(gcp_df)}")
+    gcp_df.to_csv(os.path.join(out_folder,'clean_gcp.gcp'),sep = ' ',index=False,header=False)
+    gcp_df.to_csv(os.path.join(out_folder,'clean_gcp.csv'),sep = ' ',index=False)
+    print(f"Cleaned gcp saved as GCP and TXT files at {os.path.join(out_folder,'clean_gcp*')}")
+
     return cam_gen_log   
 
 
@@ -536,7 +650,6 @@ def prepare_reference_elevations(coreg_dem_fn=None, ortho_dem_fn=None, bound_fn=
     
     return coreg_dem_fn, ortho_dem_fn
 
-
 def execute_skysat_orthorectification(img_list, out_folder, dem='WGS84', tr=None, tsrs=None, cam_folder=None, ba_prefix=None,
                                       session=None, overlap_txt=None, copy_rpc=1, orthomosaic=0):
     """
@@ -555,23 +668,28 @@ def execute_skysat_orthorectification(img_list, out_folder, dem='WGS84', tr=None
     tsrs: str
         target coordinate reference system of the mapprojected images (e.g., "EPSG:4326")
     cam_folder: str or Path
-
+        folder containing camera files with 
     ba_prefix: str or Path
-
+        prefix of the bundle_adjust output cameras
     session: str
-
+        ASP session type (e.g., "pinhole")
     overlap_txt: str or Path
-
+        file name of the overlapping stereo pairs data table (see "identify_overlapping_image_pairs")
     frame_index_fn: str or Path
-
+        file name of the frame index file
     copy_rpc: bool
-
+        whether to copy the RPC from the native image to the orthoimage
     orthomosaic: bool
+        whether to create a median mosaic of the mapprojected images, along with count, NMAD, weighted average, 
+        and mosaics from different stereo views
 
     Returns
     ----------
     None
     """
+    # Make output directory if it doesn't exist
+    if not os.path.exists(out_folder):
+        os.mkdir(out_folder)
 
     # If overlap list provided, need to remove images and cameras which were not optimized during bundle adjustment
     if overlap_txt is not None:
@@ -586,44 +704,62 @@ def execute_skysat_orthorectification(img_list, out_folder, dem='WGS84', tr=None
         img_list = [total_img[idx] for idx in sorted(uniq_idx)]
         print(f"Out of the initial {initial_count} images, {len(img_list)} will be orthorectified using adjusted cameras")
 
-    # Set up mapproject arguments
-    img_prefix = [os.path.splitext(os.path.basename(img))[0] for img in img_list]
-    out_list = [os.path.join(out_folder, img+'_map.tif') for img in img_prefix]
-    session_list = [session] * len(img_list)
-    dem_list = [dem] * len(img_list)
-    tr_list = [tr] * len(img_list)
-    srs_list = [tsrs]*len(img_list)
-    # Get list of cameras for each image
+    # Determine number of CPUs for parallelization and threads per job
+    ncpu, threads_per_job = setup_parallel_jobs(total_jobs=len(img_list))
+    
+    # Set up image specific arguments: output prefixes and cameras
+    img_prefix_list = [os.path.splitext(os.path.basename(img))[0] for img in img_list]
+    out_list = [os.path.join(out_folder, img + '_map.tif') for img in img_prefix_list]
     if session == 'pinhole':
         if ba_prefix:
-            cam_list = [glob.glob(os.path.abspath(ba_prefix)+'-'+os.path.splitext(os.path.basename(x))[0]+'*.tsai')[0] for x in img_list]
-            print("No of cameras is {}".format(len(cam_list)))
+            cam_list = [find_matching_camera_files(img, os.path.abspath(ba_prefix)) for img in img_list]
         else:
-            print(os.path.join(os.path.abspath(cam_folder),os.path.splitext(os.path.basename(img_list[0]))[0]+'*.tsai'))
-            cam_list = [glob.glob(os.path.join(os.path.abspath(cam_folder),os.path.splitext(os.path.basename(x))[0]+'*.tsai'))[0] for x in img_list]
+            cam_list = [find_matching_camera_files(img, cam_folder) for img in img_list]
+        cam_list = [cam for cam in cam_list if cam is not None] # remove null values
+        print(f"No of cameras is {len(cam_list)}")
     else:
         cam_list = [None] * len(img_list)
-    ba_prefix_list = [ba_prefix] * len(img_list)
-    
-    # Determine how to split up jobs between threads
-    ncpu = multiprocessing.cpu_count()
-    njobs = 4
-    threads = int(np.floor(ncpu/njobs))
-    threads_list = [threads] * len(img_list)
+
+    # Set up mapproject arguments
+    map_opts = []
+    map_opts.extend(['--threads', str(threads_per_job)])
+    map_opts.extend(['-t', session])
+    map_opts.extend(['--t_srs', tsrs])
+    if session!='pinhole': # only needed if bundle_adjust outputs were ".adjust" files, not camera files
+        map_opts.extend(['--bundle-adjust-prefix', ba_prefix])
+    if tr:
+        map_opts.extend(['--tr',tr])
+    # limit to integer values, with 0 as no-data
+    map_opts.extend(['--nodata-value', '0'])
+    map_opts.extend(['--ot','UInt16'])
+
+    # Combine image-specific arguments and options into a list of jobs
+    jobs_list = []
+    for img, cam, out in zip(img_list, cam_list, out_list):
+        if cam:
+            job = map_opts + [dem, img, cam, out]
+        else:
+            job = map_opts + [dem, img, out]
+        if not os.path.exists(out):
+            jobs_list.append(job)
+    print('Number of jobs = ', len(jobs_list))
+
+    print('Mapproject arguments for first job:')
+    print(jobs_list[0])
 
     # Run mapproject in parallel
-    print("Mapping given images")
-    ortho_logs = p_map(asp.mapproject, img_list, out_list, session_list, dem_list, tr_list, srs_list, cam_list,
-                       ba_prefix_list, [None]*len(img_list), threads_list, num_cpus=4)
+    print("\nMapping given images")
+    ortho_logs = p_map(run_cmd, ['mapproject']*len(jobs_list), jobs_list, num_cpus=ncpu)
+    print(ortho_logs[0])
     ortho_log = os.path.join(out_folder, 'ortho.log')
-    print("Saving Orthorectification log at {}".format(ortho_log))
+    print("Saving compiled orthorectification log at {}".format(ortho_log))
     with open(ortho_log,'w') as f:
         for log in ortho_logs:
             f.write(log)
     
     if copy_rpc == 1:
         print("Copying RPC from native image to orthoimage in parallel")
-        copy_rpc_out = p_map(skysat.copy_rpc, img_list, out_list, num_cpus=iolib.cpu_count())
+        copy_rpc_out = p_map(skysat.copy_rpc, img_list, out_list, num_cpus=multiprocessing.cpu_count())
     
     if orthomosaic == 1:
         print("Will also produce median, weighted average and highest resolution orthomosaic")
@@ -639,7 +775,6 @@ def execute_skysat_orthorectification(img_list, out_folder, dem='WGS84', tr=None
         median_mosaic = os.path.join(out_folder, '{}_median_orthomosaic.tif'.format(mos_prefix))
         wt_avg_mosaic = os.path.join(out_folder, '{}_wt_avg_orthomosaic.tif'.format(mos_prefix))
         indi_mos_list = [os.path.join(out_folder, f'{time}_first_orthomosaic.tif') for time in time_list]
-
 
         print("producing finest resolution on top mosaic, per-pixel median and wt_avg mosaic")
         all_3_view_mos_logs = p_map(asp.dem_mosaic, [res_sorted_list]*3, [res_sorted_mosaic,median_mosaic,wt_avg_mosaic], 
@@ -664,37 +799,42 @@ def execute_skysat_orthorectification(img_list, out_folder, dem='WGS84', tr=None
                 f.write(log)
 
 
-def prep_stereo_jobs_df(overlap_pkl, true_stereo=True, cross_track=False):
+def prep_stereo_df(overlap_pkl, true_stereo=True, cross_track=False):
     """
-    Prepare dataframe from input plckle file containing overlapping images with percentages
+    Prepare stereo jobs dataframe input pickle file containing overlapping images with percentages.
 
     Parameters
     ----------
-    overlap_list: str
+    overlap_pkl: str
         Path to pickle file containing overlapping images produced from skysat_overlap_parallel.py
     true_stereo: bool
-        True means output dataframe has only pairs fromed by scenes from different views
+        True means output dataframe has only pairs formed by scenes from different views
     cross_track: bool
-        whether to include cross-track stereo pairs
+        True means output dataframe has only pairs formed by scenes from the same date and satellite
 
     Returns
     ----------
     df: Pandas Dataframe
         dataframe containing list of plausible overlapping stereo pairs
     """
-    # check date, if date not equal drop
-    # then check time, if time equal drop
-    # if satellite unequal, drop
-    # then check overlap percent
-    # then make different folders for different time period
-    # to add timestamp/convergence angle filter, as list grows
-    df = pd.read_pickle(overlap_pkl)
-    df['sat1'] = [os.path.basename(x).split('_', 15)[2].split('_')[0] for x in df.img1.values]
-    df['sat2'] = [os.path.basename(x).split('_', 15)[2].split('_')[0] for x in df.img2.values]
-    df['date1'] = [os.path.basename(x).split('_', 15)[0] for x in df.img1.values]
-    df['date2'] = [os.path.basename(x).split('_', 15)[0] for x in df.img2.values]
-    df['time1'] = [os.path.basename(x).split('_', 15)[1] for x in df.img1.values]
-    df['time2'] = [os.path.basename(x).split('_', 15)[1] for x in df.img2.values]
+    # Load overlap dataframe
+    if type(overlap_pkl)==str:
+        df = pd.read_pickle(overlap_pkl)
+    elif type(overlap_pkl)==pd.DataFrame:
+        df = overlap_pkl
+    else:
+        raise ValueError("Input overlap_pkl should be a file name or pandas dataframe")
+    
+    # Check date: if dates not equal, drop
+    # Check time: if time equal, drop
+    # Check satellite: if unequal, drop
+    # Check overlap percent
+    df.loc[:, 'sat1'] = [os.path.basename(x).split('_', 15)[2].split('d', 15)[0] for x in df.img1.values]
+    df.loc[:, 'sat2'] = [os.path.basename(x).split('_', 15)[2].split('d', 15)[0] for x in df.img2.values]
+    df.loc[:, 'date1'] = [os.path.basename(x).split('_', 15)[0] for x in df.img1.values]
+    df.loc[:, 'date2'] = [os.path.basename(x).split('_', 15)[0] for x in df.img2.values]
+    df.loc[:, 'time1'] = [os.path.basename(x).split('_', 15)[1] for x in df.img1.values]
+    df.loc[:, 'time2'] = [os.path.basename(x).split('_', 15)[1] for x in df.img2.values]
     if true_stereo:
         # returned df has only those pairs which form true stereo
         df = df[df['time1'] != df['time2']]
@@ -702,135 +842,237 @@ def prep_stereo_jobs_df(overlap_pkl, true_stereo=True, cross_track=False):
             df = df[df['date1'] == df['date2']]
             df = df[df['sat1'] == df['sat2']]
     # filter to overlap percentage of around 5%
-    df['overlap_perc'] = df['overlap_perc']
-    df = df[(df['overlap_perc'] > 10)]
-    df['identifier_text'] = df['date1'] + '_' + df['time1'] + '_' + df['date2'] + '_' + df['time2']
+    df['overlap_perc'] = df['overlap_perc'] * 100
+    df = df[(df['overlap_perc'] > 5)]
+    df['identifier_text'] = df['date1'] + '_' + df['time1'] + '__' + df['date2'] + '_' + df['time2']
     df.reset_index(drop=True, inplace=True)
-    print("Number of pairs over which stereo will be attempted are {}".format(len(df)))
+
     return df
 
 
-def execute_skysat_stereo(img_folder, out_folder, session='rpc', dem=None, texture='high', cam_folder=None, 
-                          ba_prefix=None, block=1, crop_map=0, entry_point='pprc', threads=None, overlap_pkl=None, 
+def get_stereo_opts(session='rpc', threads=None, texture='normal', correlator_mode=False, unalign_disparity=False):
+    """
+    Get the stereo options for the ASP parallel_stereo command.
+
+    Parameters
+    ----------
+    session: str (default='rpc')
+        The session type to use for stereo matching. Options include 'rpc', 'pinhole', etc.
+    threads: int (default=None)
+        Number of threads to use for parallel processing. If None, will automatically determine based on CPU count.
+    texture: str (default='normal')
+        This is used for determining the correlation and refinement kernel. Options = "low", "normal".
+    correlator_mode: bool (default=False)
+        Whether to run in correlator mode (no point cloud generation). This is useful for debugging or testing purposes.
+    unalign_disparity: bool (default=False)
+        Whether to generate disparity maps without alignment. This can be used for debugging or testing purposes.
+    
+    Returns
+    ----------
+    stereo_opt: list
+        A list of command line options for the ASP parallel_stereo command.
+    """
+    stereo_opts = []
+    # session_args
+    stereo_opts.extend(['-t', session])
+    stereo_opts.extend(['--threads-multiprocess', str(threads)])
+    stereo_opts.extend(['--threads-singleprocess', str(threads)])
+    # stereo_pprc args : This is for preprocessing (adjusting image dynamic range, 
+    # alignment using ip matches, etc.)
+    stereo_opts.extend(['--individually-normalize'])
+    stereo_opts.extend(['--ip-per-tile', '8000'])
+    stereo_opts.extend(['--ip-num-ransac-iterations','2000'])
+    stereo_opts.extend(['--force-reuse-match-files'])
+    stereo_opts.extend(['--skip-rough-homography'])
+    stereo_opts.extend(['--alignment-method', 'None'])
+    # mask out completely feature less area using a std filter, to avoid gross MGM errors
+    # this is experimental and needs more testing
+    stereo_opts.extend(['--stddev-mask-thresh', '0.5'])
+    stereo_opts.extend(['--stddev-mask-kernel', '-1'])
+    # stereo_corr_args
+    stereo_opts.extend(['--stereo-algorithm', 'asp_mgm'])
+    # correlation kernel size depends on the texture
+    if texture=='low':
+        stereo_opts.extend(['--corr-kernel', '9', '9'])
+    elif texture=='normal':
+        stereo_opts.extend(['--corr-kernel', '7', '7'])
+    stereo_opts.extend(['--corr-tile-size', '1024'])
+    stereo_opts.extend(['--cost-mode', '4'])
+    stereo_opts.extend(['--corr-max-levels', '5'])
+    # stereo_rfne_args:
+    stereo_opts.extend(['--subpixel-mode', '9'])
+    if texture=='low':
+        stereo_opts.extend(['--subpixel-kernel', '21', '21'])
+    elif texture=='normal':
+        stereo_opts.extend(['--subpixel-kernel', '15', '15'])
+    stereo_opts.extend(['--xcorr-threshold', '2'])
+    stereo_opts.extend(['--num-matches-from-disparity', '10000'])
+    # limit to just correlation (no point cloud generation)
+    if correlator_mode:
+        stereo_opts.extend(['--correlator-mode'])
+    # get the disparity map without any alignment
+    if unalign_disparity:
+        stereo_opts.extend(['--unalign-disparity'])
+    
+    return stereo_opts
+
+
+def execute_skysat_stereo(overlap_pkl=None, cam_folder=None, out_folder=None, session='rpc', dem='WGS84', texture='normal',  
                           cross_track=False, correlator_mode=False):
     """
+    Execute stereo matching for SkySat images using the ASP parallel_stereo command.
+
+    Parameters
+    ----------
+    overlap_pkl: str or Path (default=None)
+        Path to the pickle file containing overlapping image pairs. This is required for stereo matching.
+    cam_folder: str or Path (default=None)
+        Path to the folder containing camera files. Required if using 'pinhole' session.
+    out_folder: str or Path
+        Path to the folder where the output stereo results will be saved.
+    session: str (default='rpc')
+        The session type to use for stereo matching. Options include 'rpc', 'pinhole', etc.
+    dem: str or Path (default=None)
+        Path to the reference DEM file. If None, will use WGS84 datum.
+    texture: str (default='normal')
+        This is used for determining the correlation and refinement kernel. Options = "low", "normal". 
+    cross_track: bool (default=False)
+        Whether to include cross-track pairs in the stereo matching. If True, will include pairs from different tracks.
+    correlator_mode: bool (default=False)
+        Whether to run in correlator mode (no point cloud generation).
+    
+    Returns
+    ----------
+    None
     """
-    from p_tqdm import p_map
-    img_folder = os.path.abspath(img_folder)
-    try:
-        img_list = sorted(glob.glob(os.path.join(img_folder, '*.tif')))
-        temp = img_list[1]
-    except BaseException:
-        img_list = sorted(glob.glob(os.path.join(img_folder, '*.tiff')))
-    if len(img_list) == 0:
-        print("No images in the specified folder, exiting")
-        sys.exit()
+    # Check if output folder exists
+    if not os.path.exists(out_folder):
+        os.makedirs(out_folder)
+    
+    # Prepare dataframe of stereo image pairs jobs
+    stereo_df = prep_stereo_df(overlap_pkl, true_stereo=True, cross_track=cross_track)
 
-    if crop_map == 1:
-        crop_map = True
-    else: 
-        crop_map = False
+    # Determine number of CPUs for parallelization and threads per job
+    ncpu, threads_per_job = setup_parallel_jobs(total_jobs=len(stereo_df))
     
-    # Define number of processes and threads per process
-    if not threads:
-        ncpu = multiprocessing.cpu_count()
-        threads = 8
-        nproc = int(np.floor(ncpu / threads))
-        
-    job_list = skysat.triplet_stereo_job_list(cross_track=cross_track, t=session,
-        threads=threads, overlap_list=overlap_pkl, img_list=img_list, ba_prefix=ba_prefix, 
-        cam_fol=cam_folder, dem=dem, crop_map=crop_map, texture=texture, outfol=out_folder, block=block,
-        entry_point=entry_point)
+    # Define stereo arguments
+    stereo_opts = get_stereo_opts(session=session, threads=threads_per_job, texture=texture, correlator_mode=correlator_mode)
     
-    print(f'Will run {len(job_list)} jobs across {nproc} processes with {threads} threads each')
+    # Create jobs list for each stereo pair
+    job_list = []
+    for _, row in stereo_df.iterrows():
+        # Determine output folder for stereo job
+        IMG1 = os.path.splitext(os.path.basename(row['img1']))[0]
+        IMG2 = os.path.splitext(os.path.basename(row['img2']))[0]
+        out_prefix = os.path.join(out_folder, row['identifier_text'], IMG1 + '__' + IMG2, 'run')  
+        # Construct the stereo job
+        if 'pinhole' in session:
+            # For pinhole cameras, use the camera files
+            cam1 = find_matching_camera_files(row['img1'], cam_folder)
+            cam2 = find_matching_camera_files(row['img2'], cam_folder)
+            job = stereo_opts + [row['img1'], cam1, row['img2'], cam2, out_prefix]
+        elif 'rpc' in session:
+            # For RPC models, use the images directly
+            stereo_args = [row['img1'], row['img2'], out_prefix]
+            job = stereo_opts + stereo_args
+        # Add DEM if using mapprojected images
+        if 'map' in session:
+            job.append(dem)
+        # Add job to list of jobs
+        job_list.append(job)
+    
+    # Run the jobs in parallel
+    # print('stereo arguments for first job:')
+    # print(job_list[0])
+    stereo_logs = p_map(asp.run_cmd, ['parallel_stereo']*len(job_list), job_list, num_cpus=ncpu)
 
-    if correlator_mode:
-        job_list = [job + ['--correlator-mode'] for job in job_list]
-    
-    # decide on number of processes
-    print(job_list[0])
-    stereo_log = p_map(asp.run_cmd,['parallel_stereo']*len(job_list), job_list, num_cpus=nproc)
+    # Save the consolidated log
     stereo_log_fn = os.path.join(out_folder, 'stereo_log.log')
+    with open(stereo_log_fn, 'w') as f:
+        for log in stereo_logs:
+            f.write(log)
     print("Consolidated stereo log saved at {}".format(stereo_log_fn))
 
 
-def dense_match_wrapper(stereo_dir, ba_dir, modify_overlap=False, img_fol=None, overlap_pkl=None, dense_match_pkl=None, out_overlap_pkl=None):
+def get_bundle_adjust_opts(ba_prefix, session='nadirpinhole', ba_dem=False, dem=None, dem_uncertainty=10,
+                           fixed_camera_indices=None, cam_weight=0, num_iter=100, num_pass=2, 
+                           threads=multiprocessing.cpu_count()):
     """
-    Copy dense matches from stereo to directory for bundle adjust use. Optionally, update the overlap list. 
+    Get the bundle adjustment options for the ASP bundle_adjust command.
 
     Parameters
-    --------
-    stereo_dir: str or Path
-        path to folder containing stereo outputs
-    ba_dir: str or Path
-        path to folder where bundle_adjust will take place
-    modify_overlap: bool (default=False)
-        whether to modify the overlap list based on which image pairs successfully found dense matches
-    img_fol: str or Path
-        path to folder containing image files
-    overlap_pkl: str or Path
-        file name of the overlap pickle to be adjusted
-    dense_match_pkl: str or Path
-        file name of the pickle containing images with dense matches
-    out_overlap_pkl: str or Path
-        file name of the output adjusted overlap pickle
+    ----------
+    ba_prefix: str or Path
+        Prefix for the bundle adjustment output files.
+    session: str (default='nadirpinhole')
+        The session type to use for bundle adjustment. Options include 'nadirpinhole', etc.
+    ba_dem: bool (default=False)
+        Whether to use a reference DEM for bundle adjustment. If True, will include DEM options.
+    dem: str or Path (default=None)
+        Path to the reference DEM file. Required if ba_dem is True.
+    dem_uncertainty: float (default=10)
+        Uncertainty parameter associated with the DEM (~meters).
+    fixed_camera_indices: str (default=None)
+        Indices of cameras to be fixed during bundle adjustment. If None, all cameras will be adjusted.
+    cam_weight: float (default=0)
+        Weight of the initial camera positions.
+    num_iter: int (default=100)
+        Number of bundle adjustment iterations.
+    num_pass: int (default=2)
+        Number of bundle adjustment passes.
+    threads: int (default=multiprocessing.cpu_count())
+        Number of threads to use for parallel processing.
     
     Returns
-    ---------
-    None
+    ----------
+    ba_opts: list
+        A list of command line options for the ASP bundle_adjust command.
     """
-    # Identify matches from stereo
-    triplet_stereo_matches = sorted(glob.glob(os.path.join(stereo_dir,'20*/*/run*-*disp*.match')))
-    print('Found {} dense matches'.format(len(triplet_stereo_matches)))
-    if  not os.path.isdir(ba_dir):
-        os.makedirs(ba_dir)
+    ba_opts = []
+    ba_opts.extend(['--threads', str(threads)])
+    ba_opts.extend(['-t', session])
+    ba_opts.extend(['-o', ba_prefix])
+    # keypoint-finding args
+    # relax triangulation error based filters to account for initial camera errors
+    ba_opts.extend(['--min-matches', '4'])
+    ba_opts.extend(['--disable-tri-ip-filter'])
+    ba_opts.extend(['--force-reuse-match-files'])
+    ba_opts.extend(['--ip-per-tile', '4000'])
+    ba_opts.extend(['--ip-inlier-factor', '0.2'])
+    ba_opts.extend(['--ip-num-ransac-iterations', '1000'])
+    ba_opts.extend(['--skip-rough-homography'])
+    ba_opts.extend(['--min-triangulation-angle', '0.0001'])
+    # save control network created from match points
+    ba_opts.extend(['--save-cnet-as-csv'])
+    # individually normalize images to properly stretch constraint 
+    # helpful in keypoint detection
+    ba_opts.extend(['--individually-normalize'])
+    # this generally assigns weight to penalize movement of camera extrinsics
+    ba_opts.extend(['--camera-position-weight', str(cam_weight)])
+    # output updated cameras, not just the adjustments (only available for pinhole cameras)
+    if session == 'nadirpinhole':
+        ba_opts.extend(['--inline-adjustments'])
+    # specify number of passes and maximum iterations per pass
+    ba_opts.extend(['--num-iterations', str(num_iter)])
+    ba_opts.extend(['--num-passes', str(num_pass)])
+    # add reference DEM if using
+    if ba_dem:
+        ba_opts.extend(['--heights-from-dem', dem])
+        ba_opts.extend(['--heights-from-dem-uncertainty', str(dem_uncertainty)])
+    if fixed_camera_indices:
+        ba_opts.extend(['--fixed-camera-indices', fixed_camera_indices])
     
-    # Copy dense matches
-    out_dense_match_list = [os.path.join(ba_dir,'run-'+os.path.basename(match).split('run-disp-',15)[1]) for match in triplet_stereo_matches]
-    pbar = tqdm(total=len(triplet_stereo_matches))
-    for idx,match in enumerate(triplet_stereo_matches):
-        shutil.copy2(match, out_dense_match_list[idx])
-        pbar.update(1)
-    pbar.close()
-    print("Copied all files successfully")
-    
-    # Update overlap list if specified
-    if modify_overlap:
-        orig_df = pd.read_pickle(overlap_pkl)
-        dense_df = pd.read_pickle(dense_match_pkl)
-        dense_img1 = list(dense_df.img1.values)
-        dense_img2 = list(dense_df.img2.values)
-        priority_list = list(zip(dense_img1,dense_img2))
-        regular_img1 = [os.path.basename(x) for x in orig_df.img1.values]
-        regular_img2 = [os.path.basename(x) for x in orig_df.img2.values]
-        secondary_list = list(zip(regular_img1,regular_img2))
-        # adapted from https://www.geeksforgeeks.org/python-extract-unique-tuples-from-list-order-irrespective/
-        # note that I am using the more inefficient answer on purpose, because I want to use image pair order from the dense match overlap list
-        total_list = priority_list + secondary_list
-        final_overlap_set = set()
-        temp = [final_overlap_set.add((a, b)) for (a, b) in total_list
-                if (a, b) and (b, a) not in final_overlap_set]
-        new_img1 = [os.path.join(img_fol,pair[0]) for pair in list(final_overlap_set)]
-        new_img2 = [os.path.join(img_fol,pair[1]) for pair in list(final_overlap_set)]
-        if not out_overlap_pkl:
-            out_overlap = os.path.join(ba_dir, 'overlap_list_adapted_from_dense_matches.txt')
-        else:
-            out_overlap = os.path.join(ba_dir, out_overlap_pkl)
-        
-        print("Saving adjusted overlap list at {}".format(out_overlap))
-        with open(out_overlap,'w') as f:
-            for idx,img1 in enumerate(new_img1):
-                out_str = '{} {}\n'.format(img1,new_img2[idx])
-                f.write(out_str)
+    return ba_opts
 
 
-def bundle_adjustment(img_folder, ba_prefix, cam_folder, overlap_pkl=None, session='nadirpinhole',
-                      ba_dem=None, ba_dem_uncertainty=10, cam_weight=0, num_iter=100, num_pass=2):
+def bundle_adjustment(img_folder=None, ba_prefix=None, cam_folder=None, dem=None, ba_dem=False, ba_dem_uncertainty=10, overlap_pkl=None, 
+                      session='nadirpinhole', texture='normal', cam_weight=0, num_iter=100, num_pass=2):
     """
-    Run bundle adjustment on a set of images. Initial testing showed that select individual images had
-    much higher errors in position/orientation compared to others, leading to insufficient adjustment upon 
-    convergence when adjusting many images at once. Thus, this program adjusts one image at a time, starting with
-    the most overlapping pair, fixing that pair, adjusting the next overlapping image, and iterating until all images are adjusted. 
+    Run stereo correlation and bundle adjustment on a set of images. Initial testing showed that select image pairs had
+    fewer features matches compared to others, leading to insufficient camera extrinsics adjustment when adjusting many images at once. 
+    Thus, this program adjusts one image pair at a time, starting with the most overlapping pair, fixing that pair, adjusting the next 
+    most-overlapping image, and iterating until all images are adjusted. For each pair, stereo is run in correlator mode, bundle adjustment 
+    is run, then the next run will use the adjusted cameras from the previous iteration.
 
     Parameters
     ---------
@@ -859,162 +1101,132 @@ def bundle_adjustment(img_folder, ba_prefix, cam_folder, overlap_pkl=None, sessi
     ----------
     None
     """
-    # Create output directory
+    # Create output directory if it doesn't exist
     out_dir = os.path.dirname(ba_prefix)
-    if not os.path.exists(out_dir):
-        os.mkdir(out_dir)
-    
-    # Grab list of images
-    img_list = sorted(glob.glob(os.path.join(img_folder,'*.tif')) + glob.glob(os.path.join(img_folder, '*.tiff')))
-    if len(img_list) < 2:
-        if os.path.islink(img_list[0]):
-            img_list = [os.readlink(x) for x in img_list]     
-    
-    # Load overlapping pairs
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Get list of image files
+    img_list = sorted(glob.glob(os.path.join(img_folder, '*.tif')) +
+                      glob.glob(os.path.join(img_folder, '*.tiff')))
+    # resolve symlink if only one image found and it is a symlink
+    if len(img_list) == 1 and os.path.islink(img_list[0]):
+        img_list = [os.readlink(x) for x in img_list]     
+
+    # Load image pairs overlap data table
     overlap = pd.read_pickle(overlap_pkl)
     overlap = overlap.loc[(overlap['img1'].isin(img_list)) & (overlap['img2'].isin(img_list))]
-    overlap = overlap.sort_values(by='overlap_perc', ascending=False)
-    overlap.reset_index(drop=True, inplace=True)
+    overlap = overlap.sort_values(by='overlap_perc', ascending=False).reset_index(drop=True)
 
-    # Make sure all image and camera pairs exist
-    # get camera extension
-    if len(glob.glob(os.path.join(cam_folder, '*.tsai'))) > 0:
-        cam_ext = '.tsai'
-    else:
-        cam_ext = '.TXT'
-    # add camera columns to overlap dataframe
-    def check_for_camera(cam_folder, img_fn, cam_ext):
-        cam_fns = glob.glob(os.path.join(cam_folder, f"*{os.path.basename(img_fn).split('_basic')[0]}*{cam_ext}"))
-        if len(cam_fns) > 0:
-            cam_fn = cam_fns[0]
-        else:
-            cam_fn = np.nan
-        return cam_fn
-    overlap['cam1'] = [check_for_camera(cam_folder, x, cam_ext)
-                       for x in overlap['img1'].values]
-    overlap['cam2'] = [check_for_camera(cam_folder, x, cam_ext)
-                       for x in overlap['img2'].values]
-    
-    # remove rows with no cameras
+    # Determine camera file extension
+    cam_ext = '.tsai' if glob.glob(os.path.join(cam_folder, '*.tsai')) else '.TXT'
+
+    # Map camera files to image pairs
+    overlap['cam1'] = overlap['img1'].apply(lambda x: find_matching_camera_files(x, cam_folder))
+    overlap['cam2'] = overlap['img2'].apply(lambda x: find_matching_camera_files(x, cam_folder))
     overlap.dropna(inplace=True)
-    # update image list
-    img_list = sorted(pd.concat([overlap['img1'].drop_duplicates(), overlap['img2'].drop_duplicates()]).drop_duplicates().values)
-    # Check if there are enough images
+
+    # Update image list to only those with valid cameras
+    img_list = sorted(pd.unique(overlap[['img1', 'img2']].values.ravel()))
     if len(img_list) < 2:
         raise Exception('Less than two images with cameras found. Check file paths and cameras')
-    print(f"Out of the initial {len(img_list)} images, {len(img_list)} will be orthorectified using adjusted cameras")
+    print(f"{len(img_list)} images found with cameras for bundle adjustment.")
 
-    # Set up bundle adjust base arguments
-    ba_args = []
-    ba_args.extend(['--threads', str(multiprocessing.cpu_count())])
-    ba_args.extend(['-t', session])
-    ba_args.extend(['-o', ba_prefix])
-    # keypoint-finding args
-    # relax triangulation error based filters to account for initial camera errors
-    ba_args.extend(['--min-matches', '4'])
-    ba_args.extend(['--disable-tri-ip-filter'])
-    ba_args.extend(['--force-reuse-match-files'])
-    ba_args.extend(['--ip-per-tile', '4000'])
-    ba_args.extend(['--ip-inlier-factor', '0.2'])
-    ba_args.extend(['--ip-num-ransac-iterations', '1000'])
-    ba_args.extend(['--skip-rough-homography'])
-    ba_args.extend(['--min-triangulation-angle', '0.0001'])
-    # save control network created from match points
-    ba_args.extend(['--save-cnet-as-csv'])
-    # individually normalize images to properly stretch constraint 
-    # helpful in keypoint detection
-    ba_args.extend(['--individually-normalize'])
-    # this generally assigns weight to penalize movement of camera extrinsics
-    ba_args.extend(['--camera-position-weight', str(cam_weight)])
-    # output updated cameras, not just the adjustments (only available for pinhole cameras)
-    if session == 'nadirpinhole':
-        ba_args.extend(['--inline-adjustments'])
-    # specify number of passes and maximum iterations per pass
-    ba_args.extend(['--num-iterations', str(num_iter)])
-    ba_args.extend(['--num-passes', str(num_pass)])
-    # add reference DEM if using
-    if ba_dem:
-        ba_args.extend(['--heights-from-dem', ba_dem])
-        ba_args.extend(['--heights-from-dem-uncertainty', str(ba_dem_uncertainty)])
+    # Define output names for adjusted cameras
+    overlap['cam1_out'] = ba_prefix + '-' + overlap['cam1'].map(os.path.basename)
+    overlap['cam2_out'] = ba_prefix + '-' + overlap['cam2'].map(os.path.basename)
 
-
-    # Run bundle adjustment in rounds...
-    # First, adjust the first two images. Then, fix those two images and adjust the next most overlapping image. 
-    # After each run, fix the adjusted images/cameras and continue until all images have been adjusted. 
-    img_tba_list = img_list
+    # Initialize with first image pair
+    img1, img2 = overlap.loc[0, ['img1', 'img2']]
+    cam1, cam2 = overlap.loc[0, ['cam1', 'cam2']]
     img_adjusted_list = []
-
-    # Start with the most overlapping pair
-    img1 = overlap.iloc[0]['img1']
-    cam1 = overlap.iloc[0]['cam1']
-    img2 = overlap.iloc[0]['img2']
-    cam2 = overlap.iloc[0]['cam2']
+    img_tba_list = img_list.copy() 
     ba_img_list = [img1, img2]
     ba_cam_list = [cam1, cam2]
     fixed_indices = None
 
-    i = 0 # iteration counter
+    i = 0
     pbar = tqdm(total=len(img_list))
-    while len(img_tba_list) > 0:
-        # Set up round-specific arguments
-        ba_args_round = ba_args.copy()
-        # fix cameras (none on first round)
-        if fixed_indices:
-            ba_args_round.extend(['--fixed-camera-indices', fixed_indices])
-        # add images and cameras
-        ba_args_round += ba_img_list + ba_cam_list 
-
-        # Run bundle adjust
-        run_cmd('parallel_bundle_adjust', ba_args_round)
-
-        # Set up next round
-        # update adjusted and to-be-adjusted lists
-        if i==0:
-            img_adjusted_list += [img1, img2]
-            pbar.update(2) # update progress bar
+    while img_tba_list:
+        if i == 0:
+            print(f'\nAdjusting {img1} and {img2}')
+            out_dir_round = os.path.join(out_dir, f"{os.path.splitext(os.path.basename(img1))[0]}__{os.path.splitext(os.path.basename(img2))[0]}")
         else:
-            img_adjusted_list += [img_tba]
-            pbar.update(1) # update progress bar
+            print(f"\nAdjusting {img_tba}")
+            out_dir_round = os.path.join(out_dir, os.path.splitext(os.path.basename(img_tba))[0])
+        os.makedirs(out_dir_round, exist_ok=True)
+
+        # Get stereo pairs to adjust in this round
+        if i == 0:
+            overlap_round = overlap[((overlap['img1'] == img1) & (overlap['img2'] == img2)) |
+                                     ((overlap['img1'] == img2) & (overlap['img2'] == img1))]
+        else:
+            overlap_round = overlap[((overlap['img1'] == img_tba) & (overlap['img2'].isin(img_adjusted_list))) |
+                                     ((overlap['img2'] == img_tba) & (overlap['img1'].isin(img_adjusted_list)))]
+        print('Number of stereo pairs in this round:', len(overlap_round))
+
+        # Run stereo correlation
+        print('Running stereo correlation')
+        execute_skysat_stereo(overlap_pkl=overlap_round, cam_folder=cam_folder, out_folder=out_dir_round,
+                            session=session, dem=dem, texture=texture, cross_track=True, correlator_mode=True)
+
+        # Move match files to round directory
+        match_files = glob.glob(os.path.join(out_dir_round, '*', '*', '*.match'))
+        print(f'Moved {len(match_files)} match files to round directory')
+        for match_file in match_files:
+            shutil.move(match_file, os.path.join(out_dir_round, os.path.basename(match_file).replace('-disp','')))
+
+        # Set up bundle adjustment parameters
+        ba_prefix_round = os.path.join(out_dir_round, 'run')
+        ba_opts = get_bundle_adjust_opts(ba_prefix_round, session=session, ba_dem=ba_dem, dem=dem,
+                                         dem_uncertainty=ba_dem_uncertainty, fixed_camera_indices=fixed_indices,
+                                         cam_weight=cam_weight, num_iter=num_iter, num_pass=num_pass)
+        ba_args = ba_opts + ba_img_list + ba_cam_list
+        print('Running bundle adjust')
+        run_cmd('parallel_bundle_adjust', ba_args)
+
+        # Move output cameras to output directory for reuse in future rounds
+        out_cams = glob.glob(ba_prefix_round + '*' + cam_ext)
+        j = 0
+        for cam in out_cams:
+            if ba_prefix_round + '-run-' not in cam:
+                shutil.move(cam, os.path.join(out_dir, os.path.basename(cam)))
+                j += 1
+        print(f'Moved {j} adjusted camera(s) to output directory for future rounds')
+
+        # Update list of adjusted images
+        if i == 0:
+            img_adjusted_list.extend([img1, img2])
+            pbar.update(2)
+        else:
+            img_adjusted_list.append(img_tba)
+            pbar.update(1)
+
+        # Determine images left to be adjusted
         img_tba_list = [x for x in img_list if x not in img_adjusted_list]
 
-        # check for remaining images
-        if len(img_tba_list) > 0: 
-            # filter the overlap dataframe
-            # each row must have one adjusted and one un-adjusted image
-            overlap_remaining = pd.concat([overlap.loc[~overlap['img1'].isin(img_adjusted_list)
-                                                       & overlap['img2'].isin(img_adjusted_list)],
-                                           overlap.loc[overlap['img1'].isin(img_adjusted_list)
-                                                       & ~overlap['img2'].isin(img_adjusted_list)]
-            ])
-            # sort by decreasing overlap percentage
-            overlap_remaining.sort_values(by='overlap_perc', ascending=False)
-            overlap_remaining.reset_index(drop=True, inplace=True)
-            # select the most overlapping image for adjustment
-            if overlap_remaining['img1'].values[0] in img_adjusted_list:
-                img_tba = overlap_remaining['img2'].values[0]
-                cam_tba = overlap_remaining['cam2'].values[0]
+        if img_tba_list:
+            # Select most overlapping unadjusted image
+            overlap_remaining = overlap[((~overlap['img1'].isin(img_adjusted_list)) & (overlap['img2'].isin(img_adjusted_list))) |
+                                        ((overlap['img1'].isin(img_adjusted_list)) & (~overlap['img2'].isin(img_adjusted_list)))]
+            overlap_remaining = overlap_remaining.sort_values(by='overlap_perc', ascending=False).reset_index(drop=True)
+
+            if overlap_remaining.iloc[0]['img1'] in img_adjusted_list:
+                img_tba, cam_tba = overlap_remaining.iloc[0][['img2', 'cam2']]
             else:
-                img_tba = overlap_remaining['img1'].values[0]
-                cam_tba = overlap_remaining['cam1'].values[0]
-            # get all images overlapping the tba image that have already been adjusted
-            overlap_remaining_img = overlap_remaining.loc[(overlap_remaining['img1']==img_tba)
-                                                            | (overlap_remaining['img2']==img_tba)]
-            img_fixed_list = ([x for x in overlap_remaining_img['img1'].values if x!= img_tba] 
-                              + [x for x in overlap_remaining_img['img2'].values if x!= img_tba])
-            cam_fixed_list = ([x for x in overlap_remaining_img['cam1'].values if x!= cam_tba] 
-                              + [x for x in overlap_remaining_img['cam2'].values if x!= cam_tba])
-            # update bundle adjust image and cam lists
-            ba_img_list = img_fixed_list + [img_tba]
-            ba_cam_list = cam_fixed_list + [cam_tba]
-            fixed_indices = ' '.join(np.arange(0,len(ba_img_list)-1).astype(str))
+                img_tba, cam_tba = overlap_remaining.iloc[0][['img1', 'cam1']]
 
-        i+=1
-        
+            # Set up images and cameras for next round
+            ba_img_list = [img_tba] + [x for x in img_adjusted_list if (overlap_remaining['img1'] == x).any() or (overlap_remaining['img2'] == x).any()]
+            ba_cam_list = [cam_tba] + [find_matching_camera_files(x, os.path.abspath(ba_prefix)) for x in ba_img_list[1:]]
+            fixed_indices = ' '.join(list(np.arange(1, len(ba_img_list)).astype(str)))
+
+        i += 1
+
     pbar.close()
-    print('Bundle adjust runs complete')
+    print('\nBundle adjust runs complete!')
 
-    # Check how many processes converged
-    log_fns = sorted(glob.glob(ba_prefix + '-log*.txt'))
+    # Check how many processes converged in the log files
+    log_fns = sorted(glob.glob(os.path.join(out_dir, '20*', '*log*.txt')))
     nconv = 0
     for log_fn in log_fns:
         with open(log_fn, 'r') as f:
@@ -1023,9 +1235,10 @@ def bundle_adjustment(img_folder, ba_prefix, cam_folder, overlap_pkl=None, sessi
             nconv += 1
     print(f'Number of bundle adjust runs that converged = {nconv} / {len(img_list)-1}')
 
+
 def gridding_wrapper(pc_list,tr,tsrs=None):
     """
-    Rasterize a list of point clouds. 
+    Rasterize a list of point clouds using ASP's point2dem command. 
 
     Parameters
     ----------
@@ -1060,49 +1273,71 @@ def gridding_wrapper(pc_list,tr,tsrs=None):
     point2dem_opts = asp.get_point2dem_opts(tr=tr, tsrs=tsrs,threads=1)
     job_list = [point2dem_opts + [pc] for pc in pc_list]
     p2dem_log = p_map(asp.run_cmd,['point2dem'] * len(job_list), job_list, num_cpus = n_cpu)
-    print(p2dem_log)
+    # print(p2dem_log)
 
 
-def dem_mosaic_wrapper(dem_list, out_folder, tr=2, tsrs='EPSG:4326', tile_size=None):
+def mosaic_dems(dem_list, out_folder, tr=2, tsrs='EPSG:4326', tile_size=None, 
+                threads=multiprocessing.cpu_count(), stats_list=['median', 'count', 'nmad']):
     """
-    Mosaic a list of DEMs using the median, count, and NMAD operators
+    Mosaic a list of DEMs using ASP's dem_mosaic tool for multiple statistics.
 
     Parameters
     ----------
-    dem_list: list of str or Path
-        list of DEM file names to mosaic
-    out_folder: str of Path
-        path to the folder where mosaics will be saved
-    tr: float or int (default=2)
-        target resolution of the outputs mosaics
-    tsrs: str (default="EPSG:4326")
-        target Coordinate Reference System of the output mosaics
-    tile_size: int
-        (optional) size of the tiles for mosaicking in chunks
+    dem_list : list of str or Path
+        List of DEM filenames to mosaic.
+    out_folder : str or Path
+        Folder where mosaics and logs will be saved.
+    tr : float or int, optional
+        Target resolution of output mosaics (default: 2).
+    tsrs : str, optional
+        Target spatial reference system (default: 'EPSG:4326').
+    tile_size : int, optional
+        Tile size for memory-efficient mosaicking.
+    stats_list : list of str, optional
+        Statistics to use for mosaicking (default: ['median', 'count', 'nmad']).
     
     Returns
     ----------
     None
     """
-    # Make output folder if it does not exist
-    if out_folder is None:
-        out_folder = os.path.join(dir,'composite_dems')
+    # Create output directory if it doesn't exist
     if not os.path.exists(out_folder):
-        os.makedirs(out_folder)
+        os.mkdir(out_folder)
     
-    # Mosaic DEMs
-    print(f"Mosaicking {len(dem_list)} DEM strips using median, count, and NMAD operators")
-    stats_list = ['median','count','nmad']
-    for stat in stats_list:
-        out_fn = os.path.join(out_folder, f'dem_{stat}_mos.tif')
-        print(f"Creating {stat} mosaic")
-        out_log = asp.dem_mosaic(dem_list, out_fn, tr=str(tr), tsrs=tsrs, stats=stat, tile_size=tile_size)
-        print(out_log)
-        # Save log
-        out_log_fn = out_fn.replace('.tif', '.log')
-        print("Saving triplet DEM mosaic log at {}".format(out_log_fn))
-        with open(out_log_fn,'w') as f:
+    # Define base dem_mosaic options
+    opts = []
+    opts.extend(['--threads', str(threads)])
+    if tr:
+        opts.extend(['--tr', str(tr)])
+    if tsrs:
+        opts.extend(['--t_srs', tsrs])
+    
+    # Iterate over statistics
+    for stat in tqdm(stats_list):
+        # define output file name
+        out_fn = os.path.join(out_folder,  f'dem_{stat}_mos.tif')
+        print(f"\nCreating {stat} mosaic")
+
+        # split into tiles if defined
+        if tile_size:
+            opts.extend(['--tile-size', str(tile_size)])
+            temp_dir = os.path.join(out_folder, f'dem_{stat}_tiles')
+            opts += ['-o', os.path.join(temp_dir, 'run')]
+            out_tile_log = run_cmd('dem_mosaic', list(map(str, dem_list)) + opts)
+            tile_files = sorted(glob.glob(str(temp_dir / 'run-*.tif')))
+            print(f"Found {len(tile_files)} tile(s)")
+            final_log = run_cmd('dem_mosaic', tile_files + ['-o', str(out_fn)])
+            shutil.rmtree(temp_dir)
+            out_log = out_tile_log + final_log
+        else:
+            opts.extend(['-o', str(out_fn)])
+            out_log = run_cmd('dem_mosaic', list(map(str, dem_list)) + opts)
+
+        # save log
+        log_fn = os.path.join(out_folder, f'dem_{stat}_mos.log')
+        with open(log_fn, 'w') as f:
             f.write(out_log)
+        print(f"Saved log to {log_fn}")
 
 
 def align_dem(refdem_fn, dem_fn, out_dir, max_displacement=100, tr=2):
@@ -1131,6 +1366,10 @@ def align_dem(refdem_fn, dem_fn, out_dir, max_displacement=100, tr=2):
     if not os.path.exists(out_dir):
         os.mkdir(out_dir)
         
+    print('Aligning the DEMs in two rounds:'
+          '\n1) ICP for translation and rotation'
+          '\n2) Nuth and Kaab for subpixel translation\n')
+    
     # Round 1: ICP
     print('Round 1: Align DEMs using ICP point-to-plane method')
     # define outputs
@@ -1148,8 +1387,11 @@ def align_dem(refdem_fn, dem_fn, out_dir, max_displacement=100, tr=2):
                         refdem_fn, dem_fn]
         out = run_cmd('pc_align', align_cmd)
         print(out)
+    else:
+        print('ICP-aligned DEM already exists in file, skipping.')
     # grid
     if os.path.exists(align_out_fn) and not os.path.exists(grid_out_fn):
+        print('Gridding the aligned point cloud')
         grid_cmd = ['--tr', str(tr), align_out_fn]
         out = run_cmd('point2dem', grid_cmd)
         print(out)
@@ -1158,99 +1400,129 @@ def align_dem(refdem_fn, dem_fn, out_dir, max_displacement=100, tr=2):
     print('Round 2: Align DEMs using Nuth and Kaab method')
     # define outputs
     dem_nk_out_fn = os.path.join(out_dir, 'run-nk-DEM.tif')
+    nk_align_matrix_fn = os.path.join(out_dir, 'run-nk-transform.txt')
     # load inputs
     if not os.path.exists(dem_nk_out_fn):
         dem = xdem.DEM(grid_out_fn, load_data=True)
         refdem = xdem.DEM(refdem_fn, load_data=True).reproject(dem)
         # align
         nk = xdem.coreg.NuthKaab().fit(refdem, dem)
-        print(nk._meta)
         dem_nk = nk.apply(dem)
+        metadata = nk._meta
         # save output
         dem_nk.save(dem_nk_out_fn)
-        print('Nuth and Kaab alignment complete!')
-        print('Aligned DEM saved to:', dem_nk_out_fn)    
+        print('Nuth and Kaab-aligned DEM saved to:', dem_nk_out_fn)   
+        # calculate and create the translation matrix
+        tx = metadata['offset_east_px'] * metadata['resolution']
+        ty = metadata['offset_north_px'] * metadata['resolution']
+        tz = metadata['vshift']
+        transform_matrix = np.array([
+            [1, 0, 0, tx],
+            [0, 1, 0, ty],
+            [0, 0, 1, tz],
+            [0, 0, 0, 1]
+        ])
+        # save to a text file
+        np.savetxt(nk_align_matrix_fn, transform_matrix, fmt="%.6f")
+        # print matrix
+        print("Transformation Matrix saved to file:", nk_align_matrix_fn)
+        print(transform_matrix)
 
     return dem_nk_out_fn
 
 
-def alignment_wrapper_single(ref_dem, source_dem, max_displacement, outprefix, align='point-to-plane',
-                             trans_only=0, initial_align=None, threads=multiprocessing.cpu_count()):
+def align_cameras(camera_list, transform_txt, outfolder, rpc=False, dem=None, img_list=None):
     """
-    Wrapper to align a DEM to a reference DEM using ASP's pc_align function. 
+    Align a list of pinhole .tsai cameras using a pc_align transform matrix.
+    Write new aligned .tsai and (optionally) RPC models.
 
     Parameters
     ----------
-    ref_dem: str or Path
-        file name of the reference DEM
-    source_dem_list: list of str or Path
-        list of the DEMs to be aligned to the reference DEM
-    max_displacement: float or int
-        maximum displacement of the source DEMs to the reference, passed to pc_align
-    outprefix: str or Path
-        prefix of the output files
-    align: str (default="point-to-plane")
-        alignment method. See Section 16.54.16 in the ASP documentation for more info:
-        https://stereopipeline.readthedocs.io/en/latest/tools/pc_align.html#pc-align-options
-    trans_only: int (default=0)
-        whether to only solve for translational alignment components (no rotation).
-    intial_align: str or Path
-        (optional) file name of the initial alignment transform
-    threads: int (default = all available CPUs)
-        how many threads to use for processing
+    camera_list : list of str
+        Paths to input pinhole .tsai camera files.
+    transform_txt : str
+        Path to pc_align 4x4 transformation matrix text file.
+    outfolder : str
+        Folder to save output aligned cameras and RPC models (if requested).
+    rpc : bool
+        Whether to compute RPC models after alignment.
+    dem : str or None
+        Path to DEM for RPC calculation.
+    img_list : list of str or None
+        List of image paths corresponding to each camera, required for RPC.
     
     Returns
     ----------
     None
     """
-    if trans_only == 0:
-        trans_only = False
-    else:
-        trans_only = True
-    asp.dem_align(ref_dem, source_dem, max_displacement, outprefix, align,
-                  trans_only, threads=threads, initial_align=initial_align)
+    # Check if DEM and image list are provided for RPC generation
+    if rpc and (not dem or not img_list):
+        raise ValueError("DEM and image list required for RPC generation.")
 
+    # Read transform matrix
+    with open(transform_txt, 'r') as f:
+        lines = [line.strip() for line in f.readlines()]
+    matrix = [list(map(float, line.split())) for line in lines[:3]]
+    rot_matrix = np.array([row[:3] for row in matrix])
+    translation = np.array([row[3] for row in matrix])
 
-def alignment_wrapper_multi(ref_dem, source_dem_list, max_displacement, align='point-to-plane', 
-                            initial_align=None, trans_only=0):
-    """
-    Wrapper to align multiple DEMs to a reference DEM.
+    # Loop over each camera
+    pbar = tqdm(total=len(camera_list))
+    for i, tsai_path in enumerate(camera_list):
+        # Read camera parameters
+        with open(tsai_path, 'r') as f:
+            lines = [line.strip() for line in f.readlines()]
 
-    Parameters
-    ----------
-    ref_dem: str or Path
-        file name of the reference DEM
-    source_dem_list: list of str or Path
-        list of the DEMs to be aligned to the reference DEM
-    max_displacement: float or int
-        maximum displacement of the source DEMs to the reference, passed to pc_align
-    align: str (default="point-to-plane")
-        alignment method. See Section 16.54.16 in the ASP documentation for more info:
-        https://stereopipeline.readthedocs.io/en/latest/tools/pc_align.html#pc-align-options
-    intial_align: str or Path
-        (optional) file name of the initial alignment transform
-    trans_only: int (default=0)
-        whether to only solve for translational alignment components (no rotation).
-    
-    Returns
-    ----------
-    None
-    """
-    outprefix_list=['{}_aligned_to{}'.format(os.path.splitext(source_dem)[0],os.path.splitext(os.path.basename(ref_dem))[0]) for source_dem in source_dem_list]
-    if trans_only == 0:
-        trans_only = False
-    else:
-        trans_only = True
-    n_source = len(source_dem_list)
-    
-    initial_align = [initial_align]*n_source
-    ref_dem_list=[ref_dem] * n_source
-    max_disp_list=[max_displacement] * n_source
-    align_list=[align] * n_source
-    trans_list=[trans_only] * n_source
-    p_umap(asp.dem_align,ref_dem_list,source_dem_list,max_disp_list,outprefix_list,
-           align_list,trans_list,[1]*n_source,initial_align,num_cpus = multiprocessing.cpu_count())
-    
+        fu = float(lines[2].split('=')[1])
+        fv = float(lines[3].split('=')[1])
+        cu = float(lines[4].split('=')[1])
+        cv = float(lines[5].split('=')[1])
+        cam_cen = np.array([float(x) for x in lines[9].split('=')[1].split()])
+        rot_flat = [float(x) for x in lines[10].split('=')[1].split()]
+        cam_rot = np.array(rot_flat).reshape((3, 3))
+        pitch = float(lines[11].split('=')[1])
+        cam_name = os.path.basename(tsai_path)
+
+        # Adjust using pc_align transformation
+        new_cen = rot_matrix @ cam_cen + translation
+        new_rot = rot_matrix @ cam_rot
+
+        # Write new .tsai
+        tsai_fn = os.path.join(outfolder, os.path.splitext(cam_name)[0] + '_adj_pc_align.tsai')
+        tsai_txt = (
+            f"VERSION_4\nPINHOLE\n"
+            f"fu = {fu}\n"
+            f"fv = {fv}\n"
+            f"cu = {cu}\n"
+            f"cv = {cv}\n"
+            f"u_direction = 1 0 0\n"
+            f"v_direction = 0 1 0\n"
+            f"w_direction = 0 0 1\n"
+            f"C = {new_cen[0]} {new_cen[1]} {new_cen[2]}\n"
+            f"R = {' '.join(map(str, new_rot.flatten()))}\n"
+            f"pitch = {pitch}\nNULL"
+        )
+        with open(tsai_fn + '.tsai', 'w') as f:
+            f.write(tsai_txt)
+
+        # Optionally write RPC
+        if rpc:
+            rpc_fn = os.path.splitext(tsai_fn)[0] + '_rpc_asp.xml'
+            cam2rpc_args = [
+                "--session", "pinhole",
+                "--dem-file", dem,
+                "--save-tif-image",
+                "--threads", str(multiprocessing.cpu_count()),
+                "--num-samples", "50",
+                "--gsd", str(30),  # can parameterize
+                img_list[i],
+                rpc_fn
+            ]
+            run_cmd('cam2rpc', cam2rpc_args, check=True)
+
+        pbar.update(1)
+    pbar.close()
+
 def align_cameras_wrapper(input_camera_list, transform_txt, outfolder, rpc=0, dem='None', img_list=None):
     """
     Wrapper for aligning a list of cameras using a transform matrix output from pc_align. 
@@ -1272,7 +1544,6 @@ def align_cameras_wrapper(input_camera_list, transform_txt, outfolder, rpc=0, de
     ----------
     None
     """
-
     n_cam=len(input_camera_list)
     if (rpc == 1) & (dem != 'None'):
         print("Will also write RPC files")
@@ -1287,7 +1558,7 @@ def align_cameras_wrapper(input_camera_list, transform_txt, outfolder, rpc=0, de
     rpc = [rpc] * n_cam
     dem = [dem] * n_cam
     
-    p_umap(asp.align_cameras, input_camera_list, transform_list, outfolder, write, rpc, dem,
+    p_umap(align_cameras, input_camera_list, transform_list, outfolder, write, rpc, dem,
            img_list, num_cpus=multiprocessing.cpu_count())
                 
 
@@ -1576,6 +1847,76 @@ def filter_stereo_jobs(mapproj_stats_fn=None, gsd_thresh=4, overlap_pkl=None, ov
     print(f'Reduced number of stereo jobs from {len(overlap)} to {len(overlap_filt)}')
     
     return img_list_filt, overlap_filt_pkl, overlap_filt_txt
+
+
+def dense_match_wrapper(stereo_dir, ba_dir):
+    """
+    Copy dense matches from stereo to directory for bundle adjust use. Optionally, update the overlap list. 
+
+    Parameters
+    --------
+    stereo_dir: str or Path
+        path to folder containing stereo outputs
+    ba_dir: str or Path
+        path to folder where bundle_adjust will take place
+    modify_overlap: bool (default=False)
+        whether to modify the overlap list based on which image pairs successfully found dense matches
+    img_fol: str or Path
+        path to folder containing image files
+    overlap_pkl: str or Path
+        file name of the overlap pickle to be adjusted
+    dense_match_pkl: str or Path
+        file name of the pickle containing images with dense matches
+    out_overlap_pkl: str or Path
+        file name of the output adjusted overlap pickle
+    
+    Returns
+    ---------
+    None
+    """
+    # Identify matches from stereo
+    triplet_stereo_matches = sorted(glob.glob(os.path.join(stereo_dir,'20*/*/run*-*disp*.match')))
+    print('Found {} dense matches'.format(len(triplet_stereo_matches)))
+    if  not os.path.isdir(ba_dir):
+        os.makedirs(ba_dir)
+    
+    # Copy dense matches
+    out_dense_match_list = [os.path.join(ba_dir,'run-'+os.path.basename(match).split('run-disp-',15)[1]) for match in triplet_stereo_matches]
+    pbar = tqdm(total=len(triplet_stereo_matches))
+    for idx,match in enumerate(triplet_stereo_matches):
+        shutil.copy2(match, out_dense_match_list[idx])
+        pbar.update(1)
+    pbar.close()
+    print("Copied all files successfully")
+    
+    # Update overlap list if specified - DOESN'T WORK WITHOUT DENSE_MATCH_PKL 
+    # if modify_overlap:
+    #     orig_df = pd.read_pickle(overlap_pkl)
+    #     dense_df = pd.read_pickle(dense_match_pkl)
+    #     dense_img1 = list(dense_df.img1.values)
+    #     dense_img2 = list(dense_df.img2.values)
+    #     priority_list = list(zip(dense_img1,dense_img2))
+    #     regular_img1 = [os.path.basename(x) for x in orig_df.img1.values]
+    #     regular_img2 = [os.path.basename(x) for x in orig_df.img2.values]
+    #     secondary_list = list(zip(regular_img1,regular_img2))
+    #     # adapted from https://www.geeksforgeeks.org/python-extract-unique-tuples-from-list-order-irrespective/
+    #     # note that I am using the more inefficient answer on purpose, because I want to use image pair order from the dense match overlap list
+    #     total_list = priority_list + secondary_list
+    #     final_overlap_set = set()
+    #     temp = [final_overlap_set.add((a, b)) for (a, b) in total_list
+    #             if (a, b) and (b, a) not in final_overlap_set]
+    #     new_img1 = [os.path.join(img_fol,pair[0]) for pair in list(final_overlap_set)]
+    #     new_img2 = [os.path.join(img_fol,pair[1]) for pair in list(final_overlap_set)]
+    #     if not out_overlap_pkl:
+    #         out_overlap = os.path.join(ba_dir, 'overlap_list_adapted_from_dense_matches.txt')
+    #     else:
+    #         out_overlap = os.path.join(ba_dir, out_overlap_pkl)
+        
+    #     print("Saving adjusted overlap list at {}".format(out_overlap))
+    #     with open(out_overlap,'w') as f:
+    #         for idx,img1 in enumerate(new_img1):
+    #             out_str = '{} {}\n'.format(img1,new_img2[idx])
+    #             f.write(out_str)
 
 
 def coregister_individual_dems(in_dir, out_dir, griddem_fn):
