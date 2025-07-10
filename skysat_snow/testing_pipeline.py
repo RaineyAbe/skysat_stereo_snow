@@ -1,8 +1,4 @@
 #! /usr/bin/env python
-"""
-Script for running the full pipeline based on workflow described in ISPRS 2020 submission
-Need to specify input image folder, input refrence DEM folder
-"""
 
 import os,glob
 import sys
@@ -92,7 +88,7 @@ if not os.path.exists(out_fol):
 print('\nSTEP 1: Clip reference DEM(s), apply optional masks')
 print('----------------------------------------\n')
 # Calculate image bounds for trimming DEM(s)
-bound_buffer_fn, utm_epsg = workflow.calculate_image_bounds(img_list, refdem_dir)
+bound_buffer_fn, utm_epsg = workflow.calculate_images_footprint(img_list, refdem_dir)
 # Trim reference DEM(s) to image bounds to speed up computations
 coreg_dem_fn = workflow.clip_raster(coreg_dem, 
                                     bound_buffer_fn, 

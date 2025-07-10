@@ -1,5 +1,6 @@
 name: skysat_stereo_snow
 channels:
+ - defaults
  - conda-forge
 dependencies:
  # core data science
@@ -11,12 +12,7 @@ dependencies:
  - ipykernel
  # geospatial (raster+vector)
  - gdal
- - rasterio
  - geopandas
- - pygeos
- - shapely
- - contextily
- - descartes
  - rioxarray
  - xarray
  - xdem
@@ -28,16 +24,10 @@ dependencies:
  - psutil
  - seaborn
  - pip:
-   # rotation_matrices
-   - pyquaternion
-   # misc
+   # parallel job running
    - p_tqdm
-   # geospatial+plotting
-   - "--editable=git+https://github.com/dshean/pygeotools.git#egg=pygeotools"
-   - "--editable=git+https://github.com/dshean/demcoreg.git#egg=demcoreg"
-   - "--editable=git+https://github.com/ShashankBice/imview.git@isprs_version#egg=imview"
-   - "--editable=git+https://github.com/cmla/rpcm.git#egg=rpcm"
    # Sx calculation
    - topo-descriptors
-   # needed for xdem ICP coregistration
+   # needed for xDEM ICP coregistration
+   - pytransform3d
    - opencv-python

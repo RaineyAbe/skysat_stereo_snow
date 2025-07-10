@@ -8,18 +8,25 @@ import geoutils as gu
 import xdem
 import multiprocessing
 from p_tqdm import p_map
-from shapely.geometry import Polygon
-from shapely.ops import unary_union
+from shapely.geometry import Polygon, Point
 import pandas as pd
 import geopandas as gpd
 import itertools
 import shutil
-import rasterio
+import rasterio as rio
 from rasterio.transform import RPCTransformer
 import re
+import rioxarray as rxr
+import xarray as xr
+import matplotlib.pyplot as plt
+from typing import List, Optional
+
+import warnings
+warnings.filterwarnings('ignore')
 
 
-def run_cmd(bin, args, **kw):
+def run_cmd(bin: str = None, 
+            args: list = None, **kw) -> str:
     """
     Wrapper for subprocess function to execute bash commands.
 
@@ -36,7 +43,8 @@ def run_cmd(bin, args, **kw):
         log (stdout) as str if the command executed, error message if the command failed
     """
     #Note, need to add full executable
-    binpath = "/Users/raineyaberle/Research/PhD/SnowDEMs/StereoPipeline-3.5.0-alpha-2024-10-05-x86_64-OSX/bin/" + bin
+    # binpath = "/Users/raineyaberle/Research/PhD/SnowDEMs/StereoPipeline-3.5.0-alpha-2024-10-05-x86_64-OSX/bin/" + bin
+    binpath = "/bsuhome/raineyaberle/StereoPipeline-3.6.0-alpha-2025-07-04-x86_64-Linux/bin/" + bin
     # binpath = shutil.which(bin)
     call = [binpath,]
     if args is not None: 
@@ -48,7 +56,7 @@ def run_cmd(bin, args, **kw):
     return out
 
 
-def setup_parallel_jobs(total_jobs: int):
+def setup_parallel_jobs(total_jobs: int = None) -> tuple[int, int]:
     """
     Determine the number of parallel jobs to run and threads per job.
 
@@ -82,7 +90,8 @@ def setup_parallel_jobs(total_jobs: int):
     return njobs, threads_per_job
 
 
-def convert_wgs_to_utm(lon: float, lat: float):
+def convert_wgs_to_utm(lon: float = None, 
+                       lat: float = None) -> str:
     """
     Return optimal UTM EPSG code based on WGS84 lat and lon coordinate pair.
 
@@ -98,30 +107,47 @@ def convert_wgs_to_utm(lon: float, lat: float):
     epsg_code: str
         optimal UTM zone, e.g. "EPSG:32606"
     """
-    utm_band = str(int((np.floor((lon + 180) / 6) % 60) + 1))
-    if len(utm_band) == 1:
-        utm_band = '0' + utm_band
-    if lat >= 0:
-        epsg_code = 'EPSG:326' + utm_band
-        return epsg_code
-    epsg_code = 'EPSG:327' + utm_band
-    print('Optimal UTM zone = ', epsg_code)
+    # check for Greenland
+    if (lat > 58) & (lon < -9) & (lon > -74):
+        epsg_code = "EPSG:5938"
+        print(f'Optimal CRS = Greenland Polar Stereographic {epsg_code}')
+
+    # check for Antarctica
+    elif (lat < -60):
+        epsg_code = "EPSG:3031"
+        print(f"Optimal CRS = Antarctic Polar Stereographic {epsg_code}")
+
+    # otherwise, calculate UTM zone
+    else:
+        utm_band = str(int((np.floor((lon + 180) / 6) % 60) + 1))
+        if len(utm_band) == 1:
+            utm_band = '0' + utm_band
+        if lat >= 0:
+            epsg_code = 'EPSG:326' + utm_band
+            return epsg_code
+        epsg_code = 'EPSG:327' + utm_band
+        print('Optimal UTM zone = ', epsg_code)
 
     return epsg_code
 
 
-def rpc_image_latlon_bounds(img_fn, height=0.0):
+def rpc_image_latlon_bounds(img_fn: str = None, 
+                            height: float = 0.0) -> tuple[float, float, float, float]:
     """
     Get bounding box (min lon, min lat, max lon, max lat) for image with RPC metadata.
 
-    Parameters:
-        img_fn (str): Path to image file with RPCs.
-        height (float): Ground height in meters used for projection.
+    Parameters
+    ----------
+    img_fn: str
+        Path to image file with RPCs.
+    height: float
+        Ground height in meters used for projection.
 
-    Returns:
-        tuple: (min_lon, min_lat, max_lon, max_lat)
+    Returns
+    ----------
+    tuple: (min_lon, min_lat, max_lon, max_lat)
     """
-    with rasterio.open(img_fn) as src:
+    with rio.open(img_fn) as src:
         if not src.rpcs:
             raise ValueError("Image does not contain RPC metadata.")
 
@@ -151,13 +177,14 @@ def rpc_image_latlon_bounds(img_fn, height=0.0):
         return min_lon, min_lat, max_lon, max_lat
 
 
-def calculate_image_bounds(img_list, out_folder):
+def calculate_images_footprint(img_list: list = None, 
+                               out_folder: str = None) -> tuple[str, str]:
     """
     Save a bounding box geopackage for all images in a folder.
 
     Parameters
     ----------
-    img_folder: str or Path
+    img_list: list
         folder containing geoTIFF files
     out_folder: str or Path
         folder where bounding box will be saved
@@ -212,19 +239,66 @@ def calculate_image_bounds(img_list, out_folder):
     return bound_buffer_fn, utm_epsg
 
 
-def clip_raster(raster_fn, crop_shp_fn, t_crs="EPSG:4326", out_dir=None):
+def calculate_baseline_to_height_ratio(img1: str = None, 
+                                       img2: str = None, 
+                                       utm_epsg: str = None) -> float:
+    """
+    Calculate the baseline to height ratio for a pair of images.
+
+    Parameters
+    ----------
+    img1: str
+        file name of the first image
+    img2: str
+        file name of the second image
+    utm_epsg: str
+        EPSG code for the optimal UTM zone, e.g. "EPSG:32601"
+    
+    Returns
+    ----------
+    b_h_ratio: float
+        baseline to height ratio, where baseline is the distance between camera centers and height is the average height of the two images
+    """
+    # iterate over images
+    cams_list, h_list = [], []
+    for img in [img1, img2]:
+        # get camera center coordinates and heights
+        with rio.open(img) as src:
+            h = src.rpcs.height_off
+            lat = src.rpcs.lat_off
+            lon = src.rpcs.long_off
+        # reproject to UTM for distance calculations
+        gdf = gpd.GeoDataFrame(index=[0], geometry=[Point(lon, lat)], crs="EPSG:4326")
+        gdf = gdf.to_crs(utm_epsg)
+        x = gdf.geometry[0].coords.xy[0][0]
+        y = gdf.geometry[0].coords.xy[0][0]
+        # save in arrays
+        cams_list += [[x,y]]
+        h_list += [h]
+    # calculate baseline
+    diff = np.array(cams_list[0]) - np.array(cams_list[1])
+    b = np.linalg.norm(diff)
+    h_mean = np.nanmean(np.array(h_list))
+    # calculate B/H ratio
+    return float(b / h_mean)
+    
+
+def clip_raster(raster_fn: str = None, 
+                crop_shp_fn: str = None, 
+                t_crs: str = "EPSG:4326", 
+                out_dir: str = None) -> str:
     """
     Trim DEM(s) to the specified footprint and optionally, mask the DEM(s) to a stable surfaces mask. 
 
     Parameters
     ----------
-    raster_fn: str | Path
+    raster_fn: str
         file name of the raster
-    crop_shp_fn: str | Path
+    crop_shp_fn: str
         file name of the geospatial file used for trimming the DEM(s)
     t_crs: str (default="EPSG:4326")
         Target Coordinate Reference System of the outputs
-    out_dir: str | Path
+    out_dir: str
         path to the folder where outputs will be saved
     
     Returns
@@ -257,7 +331,149 @@ def clip_raster(raster_fn, crop_shp_fn, t_crs="EPSG:4326", out_dir=None):
     return raster_clip_fn
 
 
-def generate_frame_cameras(img_list=None, dem_fn=None, product_level='l1b', out_folder=None):
+def apply_masks_to_images(
+        image_list: List[str],
+        mask_classes: List[str] = ["cloud", "water_check"],
+        confidence_threshold: Optional[int] = None,
+        mask_unusable: bool = True,
+        out_dir: str = None
+        ) -> List[str]:
+    """
+    Apply UDM2 and/or check for ice for a list of Planet images.
+
+    Parameters
+    ----------
+    image_list : List[str]
+        List of SkySat image file paths.
+    mask_classes : List[str]
+        UDM2 classes to mask and/or water check, which removes images with > 95% water.
+        Options: "cloud", "cloud_shadow", "snow", "light_haze", "water_check"
+    confidence_threshold : int, optional
+        Mask pixels with confidence < threshold.
+    mask_unusable : bool
+        Whether to mask pixels marked as 'unusable' in Band 8.
+    out_dir : str
+        Output directory for masked images.
+
+    Returns
+    -------
+    List[str]
+        List of masked or copied image filenames.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Define UDM2 bands
+    class_to_band = {
+        "clear": 0,
+        "snow": 1,
+        "cloud_shadow": 2,
+        "light_haze": 3,
+        "heavy_haze": 4,
+        "cloud": 5,
+        "confidence": 6,
+        "unusable": 7
+    }
+
+    def process_image(image_fn):
+        base = os.path.basename(image_fn)
+        udm2_fn = image_fn.replace("_basic_analytic.tif", "_udm2.tif")
+        only_water_check = mask_classes == ["water_check"]
+
+        # Load and scale image
+        image = rxr.open_rasterio(image_fn, masked=False)
+        image_scaled = xr.where(image == 0, np.nan, image / 1e4)
+
+        # NDWI water check
+        if "water_check" in mask_classes:
+            green = image_scaled.isel(band=1)
+            nir = image_scaled.isel(band=3)
+            ndwi = (green - nir) / (green + nir)
+            water_mask = ((ndwi > 0.3) & (green < 0.8))
+            water_fraction = water_mask.sum().data / len(water_mask.data.ravel())
+            if water_fraction > 0.99:
+                print(f"Skipping {base}, more than 99% water")
+                return None
+
+        if only_water_check:
+            # Just copy the original image over
+            out_fn = os.path.join(out_dir, os.path.basename(image_fn))
+            shutil.copy2(image_fn, out_fn)
+            return out_fn
+
+        # Otherwise, continue with masking using UDM2
+        needs_udm2 = any(cls.lower() in class_to_band for cls in mask_classes if cls.lower() != "water_check")
+        if needs_udm2 and not os.path.exists(udm2_fn):
+            print(f"Skipping {base}: missing UDM2 file")
+            return None
+
+        # Initialize mask
+        mask = xr.zeros_like(image.isel(band=0), dtype=bool)
+
+        if needs_udm2:
+            udm2 = rxr.open_rasterio(udm2_fn, masked=False)
+
+            for cls in mask_classes:
+                cls = cls.lower()
+                if cls == "water_check":
+                    continue
+                if cls not in class_to_band:
+                    raise ValueError(f"Unknown mask class: {cls}")
+                b = class_to_band[cls]
+                if b not in [0, 6, 7]:
+                    mask |= (udm2.isel(band=b) == 1)
+
+            if confidence_threshold is not None:
+                conf = udm2.isel(band=class_to_band["confidence"])
+                mask |= (conf < confidence_threshold)
+
+            if mask_unusable:
+                unusable = udm2.isel(band=class_to_band["unusable"])
+                mask |= (unusable > 0)
+
+        # Apply mask
+        image_masked = xr.where(mask, np.nan, image_scaled)
+
+        # Save result
+        image_masked = (image_masked * 1e4).astype("uint16")
+        image_masked = image_masked.rio.set_nodata(0)
+        if image.rio.crs:
+            image_masked = image_masked.rio.write_crs(image.rio.crs)
+        image_masked = image_masked.transpose('band', 'y', 'x')
+        out_path = os.path.join(out_dir, base.replace('.tif', '_masked.tif'))
+        image_masked.rio.to_raster(out_path)
+
+        return out_path
+
+    # Process images in parallel
+    processed_image_fns = p_map(process_image, image_list, num_cpus=multiprocessing.cpu_count())
+    processed_image_fns = [x for x in processed_image_fns if x]
+
+    return processed_image_fns
+
+
+def generate_frame_cameras(img_list: List[str] = None, 
+                           dem_fn: str = None, 
+                           product_level: str = 'l1b', 
+                           out_folder: str = None) -> str:
+    """
+    Generate ASP camera models and GCPs for a list of images using cam_gen.
+
+    Parameters
+    ----------
+    img_list: list
+        list of image file names
+    dem_fn: str
+        file name of the reference DEM
+    product_level: str
+        product level of the images, either 'l1b' or 'l1a'
+    out_folder: str
+        folder where output camera models and GCPs will be saved
+    
+    Returns
+    ----------
+    cam_gen_log: str
+        file name of the cam_gen log file, which contains information about the number of GCP
+    """
     # Make output directory if it doesn't exist
     if not os.path.exists(out_folder):
         os.mkdir(out_folder)
@@ -331,7 +547,8 @@ def generate_frame_cameras(img_list=None, dem_fn=None, product_level='l1b', out_
     return cam_gen_log
 
 
-def find_matching_camera_file(image_fn, cam_folder):
+def find_matching_camera_file(image_fn: str = None, 
+                              cam_folder: str = None) -> str:
     """
     Find camera file matching the image file's unique identifier.
     Parameters
@@ -371,8 +588,14 @@ def find_matching_camera_file(image_fn, cam_folder):
     return matched_fn
 
 
-def orthorectify(img_list=None, cam_folder=None, out_folder=None, dem='WGS84', 
-                 t_res=None, t_crs=None, session=None, orthomosaic=0):
+def run_mapproject(img_list: List[str] = None, 
+                   cam_folder: str = None, 
+                   out_folder: str = None, 
+                   dem: str = 'WGS84', 
+                   t_res: float = None, 
+                   t_crs: str = None, 
+                   session: str = None, 
+                   orthomosaic: bool = False) -> None:
     """
     Mapproject images onto a reference DEM and optionally, create median mosaic of mapprojected images. 
 
@@ -380,11 +603,11 @@ def orthorectify(img_list=None, cam_folder=None, out_folder=None, dem='WGS84',
     ----------
     img_list: list of str
         list of image file names
-    cam_folder: str | Path
+    cam_folder: str
         folder containing camera files
-    out_folder: str | Path
+    out_folder: str
         path to the folder where mapprojected images and cameras will be saved
-    dem: str | Path (default="WGS84")
+    dem: str (default="WGS84")
         reference DEM used for mapprojection. If None, will use the WGS84 datum.
     t_res: float | str
         target spatial resolution of the mapprojected images (meters)
@@ -436,7 +659,7 @@ def orthorectify(img_list=None, cam_folder=None, out_folder=None, dem='WGS84',
     print("\nMapping images onto DEM")
     ortho_logs = p_map(run_cmd, ['mapproject']*len(jobs_list), jobs_list, num_cpus=ncpu)
 
-    # Remove any intermediary tiling folders
+    # Remove remaining intermediary tiling folders
     tile_folders = glob.glob(os.path.join(out_folder, '*_tiles'))
     for folder in tile_folders:
         shutil.rmtree(folder)
@@ -449,7 +672,7 @@ def orthorectify(img_list=None, cam_folder=None, out_folder=None, dem='WGS84',
             f.write(log + '\n')
     
     # Create orthomosaic
-    if orthomosaic == 1:
+    if orthomosaic:
         print("Creating orthomosaic")
         # get unique image datetimes
         dt_list = list(set(sorted(['_'.join(os.path.basename(im).split('_')[0:2]) for im in out_list])))
@@ -474,21 +697,26 @@ def orthorectify(img_list=None, cam_folder=None, out_folder=None, dem='WGS84',
         run_cmd('image_mosaic', mos_args)
 
 
-
-
-# -------------------------------
-
-def identify_overlapping_image_pairs(img_list, overlap_perc=0.1, out_folder=None):
+def identify_overlapping_image_pairs(img_list: List[str] = None, 
+                                     overlap_perc: float = 10, 
+                                     bh_ratio_range: tuple = None, 
+                                     utm_epsg: str = None, 
+                                     out_folder: str = None) -> List[tuple]:
     """
     Find overlapping image pairs from a list of georeferenced images.
 
     Parameters
     ----------
-    img_list (list): 
+    img_list: list 
         List of image file paths.
-    overlap_perc (float): 
-        Minimum overlap ratio (0-1) to include pair.
-    out_folder (str or Path): 
+    overlap_perc: float 
+        Minimum overlap percent (0-100) to include pair.
+    bh_ratio_range: tuple
+        Minimum and maximum baseline to height ratio (B/H) to include pair.
+        If None, will not filter based on B/H ratio.
+    utm_epsg: str
+        EPSG code for the optimal UTM zone, e.g. "EPSG:32611"
+    out_folder: str 
         Folder where output text file will be saved.
 
     Returns
@@ -497,16 +725,24 @@ def identify_overlapping_image_pairs(img_list, overlap_perc=0.1, out_folder=None
         List of (image1, image2) pairs.
     """
     # Get image bounds polygons
-    def get_image_polygon(im_fn):
-        bounds = gu.Raster(im_fn).bounds
-        bounds_poly = Polygon([[bounds.left, bounds.bottom], [bounds.right, bounds.bottom],
-                                [bounds.right, bounds.top], [bounds.left, bounds.top],
-                                [bounds.left, bounds.bottom]])
-        return bounds_poly
-    polygons = {img: get_image_polygon(img) for img in img_list}
+    def get_image_polygon(img_fn):
+        # get lat lon bounds
+        min_lon, min_lat, max_lon, max_lat = rpc_image_latlon_bounds(img_fn)
+        # convert to polygon
+        bounds_poly = Polygon([[min_lon, min_lat], [max_lon, min_lat],
+                                [max_lon, max_lat], [min_lon, max_lat],
+                                [min_lon, min_lat]])
+        # reproject to the optimal UTM zone
+        bounds_gdf = gpd.GeoDataFrame(index=[0], geometry=[bounds_poly], crs="EPSG:4326")
+        bounds_gdf = bounds_gdf.to_crs(utm_epsg)
 
+        return bounds_gdf.geometry[0]
+    polygons = {img: get_image_polygon(img) for img in img_list}
+    
     # Compare all unique pairs
     overlapping_pairs = []
+    overlap_ratios = []
+    bh_ratios = []
     for img1, img2 in itertools.combinations(img_list, 2):
         poly1 = polygons[img1]
         poly2 = polygons[img2]
@@ -515,19 +751,286 @@ def identify_overlapping_image_pairs(img_list, overlap_perc=0.1, out_folder=None
         if not intersection.is_empty:
             area1 = poly1.area
             area2 = poly2.area
-            overlap_ratio = intersection.area / min(area1, area2)
-
-            if overlap_ratio >= overlap_perc:
-                overlapping_pairs.append((img1, img2))
-
-    # Save to file
+            overlap_percent = intersection.area / min(area1, area2) * 100
+            if overlap_percent >= overlap_perc:
+                bh_ratio = calculate_baseline_to_height_ratio(img1, img2, utm_epsg)
+                # check for B/H ratio thresholds if specified
+                if bh_ratio_range:
+                    if (bh_ratio < bh_ratio_range[0]) | (bh_ratio > bh_ratio_range[1]):
+                        continue
+                bh_ratios += [bh_ratio]
+                overlapping_pairs += [(img1, img2)]
+                overlap_ratios += [overlap_percent]
+                    
+    # Write to file
     out_fn = os.path.join(out_folder, 'overlapping_image_pairs.txt')
-    if out_fn:
-        with open(out_fn, 'w') as f:
-            for img1, img2 in overlapping_pairs:
-                f.write(f"{img1} {img2}\n")
+    # add the header
+    with open(out_fn, 'w') as f:
+        f.write(f"img1\timg2\tidentifier_text\toverlap_percent\tbh_ratio\n")
+    # iterate over pairs
+    for i, (img1, img2) in enumerate(overlapping_pairs):
+        date1, time1 = os.path.basename(img1).split('_')[0:2]
+        date2, time2 = os.path.basename(img1).split('_')[0:2]
+        identifier_text = date1 + '_' + time1 + '__' + date2 + '_' + time2
+        with open(out_fn, 'a') as f:
+            f.write(f"{img1}\t{img2}\t{identifier_text}\t{overlap_ratios[i]}\t{bh_ratios[i]}\n")
+
+    print('Overlapping stereo pairs saved to file:', out_fn)
 
     return overlapping_pairs
+
+
+def get_stereo_opts(session: str = None, 
+                    threads: int = None, 
+                    texture: str = 'normal', 
+                    correlator_mode: bool = False, 
+                    unalign_disparity: bool = False) -> List[str]:
+    """
+    Get the stereo options for the ASP parallel_stereo command.
+
+    Parameters
+    ----------
+    session: str (default=None)
+        The session type to use for stereo matching. Options include 'rpc', 'pinhole', etc. 
+        ASP can often figure this out automatically. 
+    threads: int (default=None)
+        Number of threads to use for parallel processing. If None, will automatically determine based on CPU count.
+    texture: str (default='normal')
+        This is used for determining the correlation and refinement kernel. Options = "low", "normal".
+    correlator_mode: bool (default=False)
+        Whether to run in correlator mode (no point cloud generation). This is useful for debugging or testing purposes.
+    unalign_disparity: bool (default=False)
+        Whether to generate disparity maps without alignment. This can be used for debugging or testing purposes.
+    
+    Returns
+    ----------
+    stereo_opt: list
+        A list of command line options for the ASP parallel_stereo command.
+    """
+    stereo_opts = []
+    # session_args
+    if session:
+        stereo_opts.extend(['-t', session])
+    stereo_opts.extend(['--threads-multiprocess', str(threads)])
+    stereo_opts.extend(['--threads-singleprocess', str(threads)])
+    # stereo_pprc args : This is for preprocessing (adjusting image dynamic range, 
+    # alignment using ip matches, etc.)
+    stereo_opts.extend(['--individually-normalize'])
+    stereo_opts.extend(['--ip-per-tile', '8000'])
+    stereo_opts.extend(['--ip-num-ransac-iterations','2000'])
+    stereo_opts.extend(['--force-reuse-match-files'])
+    stereo_opts.extend(['--skip-rough-homography'])
+    stereo_opts.extend(['--alignment-method', 'None'])
+    # mask out completely feature less area using a std filter, to avoid gross MGM errors
+    # this is experimental and needs more testing
+    stereo_opts.extend(['--stddev-mask-thresh', '0.5'])
+    stereo_opts.extend(['--stddev-mask-kernel', '-1'])
+    # stereo_corr_args
+    stereo_opts.extend(['--stereo-algorithm', 'asp_mgm'])
+    # correlation kernel size depends on the texture
+    if texture=='low':
+        stereo_opts.extend(['--corr-kernel', '9', '9'])
+    elif texture=='normal':
+        stereo_opts.extend(['--corr-kernel', '7', '7'])
+    stereo_opts.extend(['--corr-tile-size', '1024'])
+    stereo_opts.extend(['--cost-mode', '4'])
+    stereo_opts.extend(['--corr-max-levels', '5'])
+    # stereo_rfne_args:
+    stereo_opts.extend(['--subpixel-mode', '9'])
+    if texture=='low':
+        stereo_opts.extend(['--subpixel-kernel', '21', '21'])
+    elif texture=='normal':
+        stereo_opts.extend(['--subpixel-kernel', '15', '15'])
+    stereo_opts.extend(['--xcorr-threshold', '2'])
+    stereo_opts.extend(['--num-matches-from-disparity', '10000'])
+    # limit to just correlation (no point cloud generation)
+    if correlator_mode:
+        stereo_opts.extend(['--correlator-mode'])
+    # get the disparity map without any alignment
+    if unalign_disparity:
+        stereo_opts.extend(['--unalign-disparity'])
+    
+    return stereo_opts
+
+
+def run_stereo(stereo_pairs_fn: str = None, 
+               cam_folder: str = None, 
+               out_folder: str = None, 
+               session: str = None,
+               texture: str = 'normal', 
+               correlator_mode: bool = False) -> None:
+    """
+    Execute stereo matching for SkySat images using the ASP parallel_stereo command.
+
+    Parameters
+    ----------
+    stereo_pairs_fn: str (default=None)
+        Path to the text file containing overlapping image pairs.
+    cam_folder: str or Path (default=None)
+        Path to the folder containing camera files. Required if using 'pinhole' session.
+    out_folder: str or Path
+        Path to the folder where the output stereo results will be saved.
+    session: str (default=None)
+        The session type to use for stereo matching. Options include 'rpc', 'pinhole', etc. ASP can often figure this out automatically.
+    texture: str (default='normal')
+        How much relative texture there is in your images. This is used for determining the correlation and refinement kernel. 
+        Options = "low", "normal". For example, a flat, snowy landscape likely has "low" texture. 
+    correlator_mode: bool (default=False)
+        Whether to run in correlator mode (no point cloud generation).
+    
+    Returns
+    ----------
+    None
+    """
+    # Check if output folder exists
+    if not os.path.exists(out_folder):
+        os.makedirs(out_folder)
+    
+    # Load the stereo pairs
+    stereo_pairs_df = pd.read_csv(stereo_pairs_fn, delimiter='\t', header=0)
+
+    # Determine number of CPUs for parallelization and threads per job
+    ncpu, threads_per_job = setup_parallel_jobs(total_jobs=len(stereo_pairs_df))
+    
+    # Define stereo arguments
+    stereo_opts = get_stereo_opts(session=session, threads=threads_per_job, texture=texture, correlator_mode=correlator_mode)
+    
+    # Create jobs list for each stereo pair
+    job_list = []
+    for _, row in stereo_pairs_df.iterrows():
+        # Determine output folder for stereo job
+        IMG1 = os.path.splitext(os.path.basename(row['img1']))[0]
+        IMG2 = os.path.splitext(os.path.basename(row['img2']))[0]
+        out_prefix = os.path.join(out_folder, row['identifier_text'], IMG1 + '__' + IMG2, 'run')  
+        # Construct the stereo job
+        if cam_folder:
+            # Use the camera files if provided
+            cam1 = find_matching_camera_file(row['img1'], cam_folder)
+            cam2 = find_matching_camera_file(row['img2'], cam_folder)
+            job = stereo_opts + [row['img1'], cam1, row['img2'], cam2, out_prefix]
+        else:
+            # Otherwise, use the images directly
+            stereo_args = [row['img1'], row['img2'], out_prefix]
+            job = stereo_opts + stereo_args
+        # Add job to list of jobs
+        job_list.append(job)
+    
+    # Run the jobs in parallel
+    print('stereo arguments for first job:')
+    print(job_list[0])
+    stereo_logs = p_map(run_cmd, ['parallel_stereo']*len(job_list), job_list, num_cpus=ncpu)
+
+    # Save the consolidated log
+    stereo_log_fn = os.path.join(out_folder, 'stereo_log.log')
+    with open(stereo_log_fn, 'w') as f:
+        for log in stereo_logs:
+            f.write(log + '\n')
+    print("Consolidated stereo log saved at {}".format(stereo_log_fn))
+
+
+def coregister_dems_xdem(dem_fn: str = None, 
+                         refdem_fn: str = None, 
+                         ortho_fn: str = None, 
+                         out_dir: str = None) -> tuple:
+    """
+    Coregister a DEM to a reference DEM using xdem. Optionally, apply the same translation to an orthomosaic.
+
+    Parameters
+    ----------
+    dem_fn: str
+        file name of the DEM to be coregistered
+    refdem_fn: str
+        file name of the reference DEM
+    ortho_fn: str
+        file name of the orthomosaic to be coregistered
+    out_dir: str
+        path to the folder where outputs will be saved
+
+    Returns
+    ----------
+    dem_coreg_fn: str
+        file name of the coregistered DEM
+    ortho_coreg_fn: str
+        file name of the coregistered orthomosaic
+
+    """
+    # Determine optimal CRS
+    dem = gu.Raster(dem_fn).reproject(crs="EPSG:4326")
+    dem_cen_lon = (dem.bounds.right + dem.bounds.left) / 2
+    dem_cen_lat = (dem.bounds.bottom + dem.bounds.top) / 2
+    out_crs = convert_wgs_to_utm(dem_cen_lon, dem_cen_lat)
+    
+    # Reproject DEMs and save to file
+    def reproject_and_save_raster(raster_fn, out_crs):
+        raster = gu.Raster(raster_fn)
+        if raster.crs != out_crs:
+            raster_reproj_fn = os.path.splitext(raster_fn)[0] + f'_{out_crs.replace(':','')}.tif'
+            raster = raster.reproject(crs=out_crs)
+            raster.save(raster_reproj_fn)
+            print('Reprojected raster saved to file:', raster_reproj_fn)
+            return raster_reproj_fn
+        else:
+            return raster_fn
+    dem_reproj_fn = reproject_and_save_raster(dem_fn, out_crs)
+    refdem_reproj_fn = reproject_and_save_raster(refdem_fn, out_crs)        
+    
+    # Load DEMs
+    refdem = xdem.DEM(refdem_reproj_fn)
+    dem = xdem.DEM(dem_reproj_fn)
+    dem_reproj = dem.reproject(refdem) # coregister with dem upscaled to refdem
+
+    # Coregister
+    print('\nCoregistering DEMs using the Iterative Closest Point method...') 
+    # then Nuth and Kaab methods...')
+    # coreg = xdem.coreg.CoregPipeline([xdem.coreg.ICP(), 
+    #                                   xdem.coreg.NuthKaab(subsample=1)]).fit(refdem, dem_reproj)
+    coreg = xdem.coreg.ICP().fit(refdem, dem_reproj)
+    coreg_matrix = coreg.to_matrix()
+    print('Coregistration matrix:')
+    print(coreg_matrix)
+    dem_coreg = coreg.apply(dem)
+
+    # Save coregistered DEM to file
+    dem_coreg_fn = os.path.join(out_dir,
+                                os.path.splitext(os.path.basename(dem_reproj_fn))[0] + '_coregistered.tif')
+    dem_coreg.save(dem_coreg_fn)
+    print('Coregistered DEM saved to file:', dem_coreg_fn)
+
+    # Apply translation to orthomosaic
+    if ortho_fn:
+        print('\nApplying the coregistration translation to orthomosaic...')
+        # subset just the conregistration matrix to 2D (no z-shift needed for the orthomosaic)
+        from affine import Affine
+        affine_transform = Affine(coreg_matrix[0, 0], coreg_matrix[0, 1], coreg_matrix[0, 3],
+                                    coreg_matrix[1, 0], coreg_matrix[1, 1], coreg_matrix[1, 3])
+        # reproject orthomosaic
+        ortho_reproj_fn = reproject_and_save_raster(ortho_fn, out_crs)
+        # load the reprojected orthomosaic
+        ortho = gu.Raster(ortho_reproj_fn)
+        # apply transform to the orthomosaic
+        original_transform = ortho.transform
+        new_transform = original_transform * affine_transform
+        new_crs = ortho.crs
+        new_nodata = ortho.nodata
+        if not new_nodata:
+            new_nodata = ortho.data.data.ravel()[0]
+        ortho_coreg = gu.Raster.from_array(ortho.data, 
+                                           transform = new_transform,
+                                           crs = new_crs,
+                                           nodata = new_nodata)
+        # save to file
+        ortho_coreg_fn = os.path.join(out_dir,
+                                        os.path.splitext(os.path.basename(ortho_reproj_fn))[0] + '_coregistered.tif')
+        ortho_coreg.save(ortho_coreg_fn)
+        print('Coregistered orthomosaic saved to file:', ortho_coreg_fn)
+    else:
+        ortho_coreg_fn = None
+
+    return dem_coreg_fn, ortho_coreg_fn
+
+
+
+# -------------------------------
 
 
 def construct_land_cover_masks(multispec_path, out_folder, ndvi_threshold=0.5, ndsi_threshold=0.0, plot_results=True):
@@ -755,148 +1258,6 @@ def prep_stereo_df(overlap_pkl, true_stereo=True, cross_track=False):
     return df
 
 
-def get_stereo_opts(session='rpc', threads=None, texture='normal', correlator_mode=False, unalign_disparity=False):
-    """
-    Get the stereo options for the ASP parallel_stereo command.
-
-    Parameters
-    ----------
-    session: str (default='rpc')
-        The session type to use for stereo matching. Options include 'rpc', 'pinhole', etc.
-    threads: int (default=None)
-        Number of threads to use for parallel processing. If None, will automatically determine based on CPU count.
-    texture: str (default='normal')
-        This is used for determining the correlation and refinement kernel. Options = "low", "normal".
-    correlator_mode: bool (default=False)
-        Whether to run in correlator mode (no point cloud generation). This is useful for debugging or testing purposes.
-    unalign_disparity: bool (default=False)
-        Whether to generate disparity maps without alignment. This can be used for debugging or testing purposes.
-    
-    Returns
-    ----------
-    stereo_opt: list
-        A list of command line options for the ASP parallel_stereo command.
-    """
-    stereo_opts = []
-    # session_args
-    stereo_opts.extend(['-t', session])
-    stereo_opts.extend(['--threads-multiprocess', str(threads)])
-    stereo_opts.extend(['--threads-singleprocess', str(threads)])
-    # stereo_pprc args : This is for preprocessing (adjusting image dynamic range, 
-    # alignment using ip matches, etc.)
-    stereo_opts.extend(['--individually-normalize'])
-    stereo_opts.extend(['--ip-per-tile', '8000'])
-    stereo_opts.extend(['--ip-num-ransac-iterations','2000'])
-    stereo_opts.extend(['--force-reuse-match-files'])
-    stereo_opts.extend(['--skip-rough-homography'])
-    stereo_opts.extend(['--alignment-method', 'None'])
-    # mask out completely feature less area using a std filter, to avoid gross MGM errors
-    # this is experimental and needs more testing
-    stereo_opts.extend(['--stddev-mask-thresh', '0.5'])
-    stereo_opts.extend(['--stddev-mask-kernel', '-1'])
-    # stereo_corr_args
-    stereo_opts.extend(['--stereo-algorithm', 'asp_mgm'])
-    # correlation kernel size depends on the texture
-    if texture=='low':
-        stereo_opts.extend(['--corr-kernel', '9', '9'])
-    elif texture=='normal':
-        stereo_opts.extend(['--corr-kernel', '7', '7'])
-    stereo_opts.extend(['--corr-tile-size', '1024'])
-    stereo_opts.extend(['--cost-mode', '4'])
-    stereo_opts.extend(['--corr-max-levels', '5'])
-    # stereo_rfne_args:
-    stereo_opts.extend(['--subpixel-mode', '9'])
-    if texture=='low':
-        stereo_opts.extend(['--subpixel-kernel', '21', '21'])
-    elif texture=='normal':
-        stereo_opts.extend(['--subpixel-kernel', '15', '15'])
-    stereo_opts.extend(['--xcorr-threshold', '2'])
-    stereo_opts.extend(['--num-matches-from-disparity', '10000'])
-    # limit to just correlation (no point cloud generation)
-    if correlator_mode:
-        stereo_opts.extend(['--correlator-mode'])
-    # get the disparity map without any alignment
-    if unalign_disparity:
-        stereo_opts.extend(['--unalign-disparity'])
-    
-    return stereo_opts
-
-
-def execute_skysat_stereo(overlap_pkl=None, cam_folder=None, out_folder=None, session='rpc', dem='WGS84', texture='normal',  
-                          cross_track=False, correlator_mode=False):
-    """
-    Execute stereo matching for SkySat images using the ASP parallel_stereo command.
-
-    Parameters
-    ----------
-    overlap_pkl: str or Path (default=None)
-        Path to the pickle file containing overlapping image pairs. This is required for stereo matching.
-    cam_folder: str or Path (default=None)
-        Path to the folder containing camera files. Required if using 'pinhole' session.
-    out_folder: str or Path
-        Path to the folder where the output stereo results will be saved.
-    session: str (default='rpc')
-        The session type to use for stereo matching. Options include 'rpc', 'pinhole', etc.
-    dem: str or Path (default=None)
-        Path to the reference DEM file. If None, will use WGS84 datum.
-    texture: str (default='normal')
-        This is used for determining the correlation and refinement kernel. Options = "low", "normal". 
-    cross_track: bool (default=False)
-        Whether to include cross-track pairs in the stereo matching. If True, will include pairs from different tracks.
-    correlator_mode: bool (default=False)
-        Whether to run in correlator mode (no point cloud generation).
-    
-    Returns
-    ----------
-    None
-    """
-    # Check if output folder exists
-    if not os.path.exists(out_folder):
-        os.makedirs(out_folder)
-    
-    # Prepare dataframe of stereo image pairs jobs
-    stereo_df = prep_stereo_df(overlap_pkl, true_stereo=True, cross_track=cross_track)
-
-    # Determine number of CPUs for parallelization and threads per job
-    ncpu, threads_per_job = setup_parallel_jobs(total_jobs=len(stereo_df))
-    
-    # Define stereo arguments
-    stereo_opts = get_stereo_opts(session=session, threads=threads_per_job, texture=texture, correlator_mode=correlator_mode)
-    
-    # Create jobs list for each stereo pair
-    job_list = []
-    for _, row in stereo_df.iterrows():
-        # Determine output folder for stereo job
-        IMG1 = os.path.splitext(os.path.basename(row['img1']))[0]
-        IMG2 = os.path.splitext(os.path.basename(row['img2']))[0]
-        out_prefix = os.path.join(out_folder, row['identifier_text'], IMG1 + '__' + IMG2, 'run')  
-        # Construct the stereo job
-        if 'pinhole' in session:
-            # For pinhole cameras, use the camera files
-            cam1 = find_matching_camera_files(row['img1'], cam_folder)
-            cam2 = find_matching_camera_files(row['img2'], cam_folder)
-            job = stereo_opts + [row['img1'], cam1, row['img2'], cam2, out_prefix]
-        elif 'rpc' in session:
-            # For RPC models, use the images directly
-            stereo_args = [row['img1'], row['img2'], out_prefix]
-            job = stereo_opts + stereo_args
-        # Add DEM if using mapprojected images
-        if 'map' in session:
-            job.append(dem)
-        # Add job to list of jobs
-        job_list.append(job)
-    
-    # Run the jobs in parallel
-    # print('stereo arguments for first job:')
-    # print(job_list[0])
-    stereo_logs = p_map(asp.run_cmd, ['parallel_stereo']*len(job_list), job_list, num_cpus=ncpu)
-
-    # Save the consolidated log
-    stereo_log_fn = os.path.join(out_folder, 'stereo_log.log')
-    with open(stereo_log_fn, 'w') as f:
-        for log in stereo_logs:
-            f.write(log + '\n')
-    print("Consolidated stereo log saved at {}".format(stereo_log_fn))
 
 
 def get_bundle_adjust_opts(ba_prefix, session='nadirpinhole', ba_dem=False, dem=None, dem_uncertainty=10,
@@ -1463,7 +1824,7 @@ def align_cameras_wrapper(input_camera_list, transform_txt, outfolder, rpc=0, de
     rpc = [rpc] * n_cam
     dem = [dem] * n_cam
     
-    p_umap(align_cameras, input_camera_list, transform_list, outfolder, write, rpc, dem,
+    p_map(align_cameras, input_camera_list, transform_list, outfolder, write, rpc, dem,
            img_list, num_cpus=multiprocessing.cpu_count())
                 
 
@@ -1488,11 +1849,8 @@ def plot_composite_fig(ortho_fn, georegistered_median_dem_fn, count_fn, nmad_fn,
     ----------
     None
     """
-    import matplotlib.pyplot as plt
     from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
-    import rasterio as rio
     from matplotlib import colors
-    import numpy as np
 
     # Read files
     def read_data(raster):
