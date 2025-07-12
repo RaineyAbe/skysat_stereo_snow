@@ -176,8 +176,6 @@ def align_photos(img_list: List[str] = None,
         Folder containing refined ASP .tsai camera models to initialize camera positions.
     gcp_csv : str, optional
         Path to tab-delimited CSV file with GCPs: columns = index, lat, lon, elevation.
-    fix_cameras : bool, optional
-        If True, constrain cameras to ASP-refined positions to minimize movement.
 
     Returns
     -------
@@ -327,17 +325,17 @@ def build_dem(project_fn: str = None,
     # Load project
     doc = Metashape.Document()
     doc.open(project_fn)
-    project_name = os.path.splitext(os.path.basename(project_fn))[0]
-
-    # Define outputs
-    pc_fn = os.path.join(out_dir, project_name + '_point_cloud.laz')
-    dem_fn = os.path.join(out_dir, project_name + "_DEM.tif")
-    ortho_fn = os.path.join(out_dir, project_name + '_orthomosaic.tif')
+    project_name = os.path.splitext(os.path.basename(project_fn))[0]    
 
     # Check if project has a chunk
     if not doc.chunks:
         raise ValueError("No chunks found in the project.")
     chunk = doc.chunks[0]
+
+    # Define outputs
+    pc_fn = os.path.join(out_dir, project_name + '_point_cloud.laz')
+    dem_fn = os.path.join(out_dir, project_name + "_DEM.tif")
+    ortho_fn = os.path.join(out_dir, project_name + '_orthomosaic.tif')
 
     # Group cameras by date
     # def extract_date(label):
@@ -361,8 +359,8 @@ def build_dem(project_fn: str = None,
 
     # Build depth maps
     print("\nBuilding depth maps...")
-    chunk.buildDepthMaps(downscale = 2, 
-                         filter_mode = Metashape.AggressiveFiltering)
+    chunk.buildDepthMaps(downscale = 2, # 2 = high quality
+                         filter_mode = Metashape.MildFiltering)
     doc.save(project_fn, chunks=doc.chunks)
 
     # Build dense point cloud
@@ -399,7 +397,8 @@ def build_dem(project_fn: str = None,
     # export to fiile
     chunk.exportRaster(ortho_fn,
                        source_data = Metashape.OrthomosaicData,
-                       split_in_blocks = False)
+                       split_in_blocks = False,
+                       nodata_value = -32767)
 
     return pc_fn, dem_fn, ortho_fn
 
@@ -444,7 +443,7 @@ def plot_results_fig(dem_fn: str = None,
 
     # Plot
     plt.rcParams.update({'font.size': 12})
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
     fig.subplots_adjust(bottom=0.15)
     # Orthoimage
     ax[0].imshow(np.dstack([ortho.isel(band=2).data, ortho.isel(band=1).data, ortho.isel(band=0).data]),
@@ -472,7 +471,7 @@ def plot_results_fig(dem_fn: str = None,
                               dem.rio.bounds()[1]/1e3, dem.rio.bounds()[3]/1e3))
     ax[1].set_xlabel('Easting [km]')
     x0, width = ax[1].get_position().x0, ax[1].get_position().width
-    cax = fig.add_axes([x0, 0.1, width, 0.03])
+    cax = fig.add_axes([x0, 0.0, width, 0.03])
     plt.colorbar(im, cax=cax, orientation='horizontal', label='Elevation [m]')
     ax[1].set_title('DEM')
     ax[1].set_xlim(ax[0].get_xlim())

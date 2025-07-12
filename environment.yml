@@ -4,7 +4,7 @@ channels:
  - conda-forge
 dependencies:
  # core data science
- - python
+ - python=3.13
  - scipy
  - numpy
  - pandas
