@@ -16,7 +16,7 @@ pip install skysat_stereo_snow
 ```
 
 3. Install the Agisoft Metashape Python 3 Module:
-- Download the appropriate installer for OS: https://www.agisoft.com/downloads/installer/
+- Download the appropriate installer for your OS: https://www.agisoft.com/downloads/installer/
 - `pip install` the installer while in the skysat_stereo_snow environment. 
 
 4. Download Basic Analytic (TOAR) unrectified assets for your SkySat capture. 
