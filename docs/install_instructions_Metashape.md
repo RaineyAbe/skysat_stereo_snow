@@ -25,9 +25,9 @@ pip install -e ../skysat_stereo_snow
 earthengine authenticate
 ```
 
-4. Download Basic Analytic (TOAR) unrectified assets from your SkySat capture(s). 
+5. Download Basic Analytic (TOAR) unrectified assets from your SkySat capture(s). 
 
-5. To run the full pipeline: See the `scripts/skysat_triplet_pipeline_Metashape.py` script. NOTE: If you'd like to all align photos over the same region for different dates, then construct a separate DEM and orthomosaic for each date separately, place all images into a single folder. 
+6. To run the full pipeline: See the `scripts/skysat_triplet_pipeline_Metashape.py` script. NOTE: If you'd like to all align photos over the same region for different dates, then construct a separate DEM and orthomosaic for each date separately, place all images into a single folder. 
 
 __Notes for Borah / HPC users:__ 
 
