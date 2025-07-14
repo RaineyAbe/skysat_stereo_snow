@@ -3,10 +3,10 @@
 1. Clone (or fork then clone) this GitHub repository by running the following in the command line:
 
 ```
-git clone https://github.com/RaineyAbe/skysat_stereo_snow
+git clone https://github.com/RaineyAbe/skysat_stereo_snow.git
 ```
 
-2. Install the required packages. We recommend using [Mamba or Micromamba](https://mamba.readthedocs.io/en/latest/index.html) for package management: 
+2. Install the required packages shown in `environment.yml`. We recommend using [Mamba or Micromamba](https://mamba.readthedocs.io/en/latest/index.html) for package management: 
 
 ```
 cd skysat_stereo_snow
@@ -17,6 +17,7 @@ pip install -e ../skysat_stereo_snow
 
 3. Install the Agisoft Metashape Python 3 Module:
 - Download the appropriate installer for your OS: https://www.agisoft.com/downloads/installer/
+
 - `pip install Metashape-*.whl` while in the skysat_stereo_snow environment. 
 
 4. Optional: For querying and downloading a reference DEM from Google Earth Engine, authenticate your GEE account. In the command line, run the following to start the authentication process. 
