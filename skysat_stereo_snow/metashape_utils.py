@@ -13,6 +13,7 @@ import csv
 from tqdm import tqdm
 import rioxarray as rxr
 from typing import List
+from collections import defaultdict
 
 
 def ecef_to_geodetic(x: float = None, 
@@ -241,12 +242,7 @@ def align_photos(img_list: List[str] = None,
                 camera.reference.enabled = True
                 camera.reference.accuracy = Metashape.Vector([10, 10, 10])
 
-        generic_preselection=False  
-        reference_preselection=True
         doc.save(project_fn, chunks=doc.chunks)
-    else:
-        generic_preselection=True  
-        reference_preselection=False
 
     # Load GCPs
     if gcp_csv:
@@ -273,8 +269,8 @@ def align_photos(img_list: List[str] = None,
 
     # Match and align photos
     chunk.matchPhotos(downscale = 2,
-                      generic_preselection=generic_preselection,
-                      reference_preselection=reference_preselection,
+                      generic_preselection=True,
+                      reference_preselection=False,
                       keypoint_limit=40000,
                       tiepoint_limit=10000,
                       reset_matches=True)
@@ -296,7 +292,8 @@ def align_photos(img_list: List[str] = None,
 
 def build_dem(project_fn: str = None, 
               dem_resolution: float = 2, 
-              out_dir: str = None) -> tuple[str, str, str]:
+              out_dir: str = None,
+              out_nodata=-9999) -> tuple[str, str, str]:
     """
     Build a dense point cloud, DEM, and orthomosaic from a Metashape project containing aligned photos.
 
@@ -332,41 +329,49 @@ def build_dem(project_fn: str = None,
         raise ValueError("No chunks found in the project.")
     chunk = doc.chunks[0]
 
-    # Define outputs
-    pc_fn = os.path.join(out_dir, project_name + '_point_cloud.laz')
-    dem_fn = os.path.join(out_dir, project_name + "_DEM.tif")
-    ortho_fn = os.path.join(out_dir, project_name + '_orthomosaic.tif')
-
     # Group cameras by date
     # def extract_date(label):
     #     match = re.match(r"(\d{8})", label)
     #     return match.group(1) if match else None
     # cameras_by_date = defaultdict(list)
     # for camera in chunk.cameras:
-    #     if camera.type == Metashape.Camera.Type.Regular and camera.label.endswith(".tif"):
-    #         date = extract_date(camera.label)
-    #         if date:
-    #             cameras_by_date[date].append(camera)
+    #     date = extract_date(camera.label)
+    #     if date:
+    #         cameras_by_date[date].append(camera)
 
     # # Create a chunk for each date and process
+    # dem_fns, ortho_fns = [], [] # initialize list of files
     # for date, cameras in cameras_by_date.items():
     #     print(f"Processing date: {date} with {len(cameras)} images")
 
         # # Duplicate chunk
         # date_chunk = chunk.copy()
-        # doc.chunks.add(date_chunk)
-        # date_chunk.label = f"{chunk.label}_{date}"
+        # date_chunk.label = date
 
+        # # Disable images not captured on date
+        # for cam in date_chunk.cameras:
+        #     if cam not in cameras:
+        #         cam.enabled = False
+
+    # Define outputs
+    pc_fn = os.path.join(out_dir, project_name + f'_point_cloud.laz')
+    dem_fn = os.path.join(out_dir, project_name + f'_DEM.tif')
+    ortho_fn = os.path.join(out_dir, project_name + f'_orthomosaic.tif')
+        
     # Build depth maps
     print("\nBuilding depth maps...")
-    chunk.buildDepthMaps(downscale = 2, # 2 = high quality
-                         filter_mode = Metashape.MildFiltering)
+    chunk.buildDepthMaps(
+        downscale = 2, # 2 = high quality
+        filter_mode = Metashape.MildFiltering
+        )
     doc.save(project_fn, chunks=doc.chunks)
 
     # Build dense point cloud
     print("\nBuilding dense point cloud...")
-    chunk.buildPointCloud(point_colors = True, 
-                          point_confidence = True)
+    chunk.buildPointCloud(
+        point_colors = True, 
+        point_confidence = True
+        )
     doc.save(project_fn, chunks=doc.chunks)
     # export to file
     chunk.exportPointCloud(path=pc_fn)
@@ -376,31 +381,37 @@ def build_dem(project_fn: str = None,
     # for whatever reason, you need to save and reload before building DEM...
     doc.save(project_fn, chunks=doc.chunks)
     chunk = doc.chunks[0]
-    chunk.buildDem(source_data=Metashape.PointCloudData,
-                   resolution=dem_resolution,
-                   interpolation=Metashape.Interpolation.DisabledInterpolation)
+    chunk.buildDem(
+        source_data=Metashape.PointCloudData,
+        resolution=dem_resolution,
+        interpolation=Metashape.Interpolation.DisabledInterpolation
+        )
     doc.save(project_fn, chunks=doc.chunks)
     # export to file
-    chunk.exportRaster(dem_fn, 
-                       source_data = Metashape.ElevationData,
-                       image_format = Metashape.ImageFormatTIFF, 
-                       format = Metashape.RasterFormatTiles, 
-                       nodata_value = -32767, 
-                       save_kml = False, 
-                       save_world = False,
-                       resolution = dem_resolution)
+    chunk.exportRaster(
+        dem_fn, 
+        source_data = Metashape.ElevationData,
+        image_format = Metashape.ImageFormatTIFF, 
+        format = Metashape.RasterFormatTiles, 
+        nodata_value = out_nodata, 
+        save_kml = False, 
+        save_world = False,
+        resolution = dem_resolution
+        )
 
     # Build orthomosaic
     print('\nBuilding orthomosaic...')
     chunk.buildOrthomosaic(surface_data=Metashape.ElevationData)
     doc.save(project_fn, chunks=doc.chunks)
     # export to fiile
-    chunk.exportRaster(ortho_fn,
-                       source_data = Metashape.OrthomosaicData,
-                       split_in_blocks = False,
-                       nodata_value = -32767)
+    chunk.exportRaster(
+        ortho_fn,
+        source_data = Metashape.OrthomosaicData,
+        split_in_blocks = False,
+        nodata_value = out_nodata
+        )
 
-    return pc_fn, dem_fn, ortho_fn
+    return dem_fn, ortho_fn
 
 
 def plot_results_fig(dem_fn: str = None, 

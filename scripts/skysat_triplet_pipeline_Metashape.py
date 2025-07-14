@@ -90,12 +90,12 @@ def main():
     # step 2: align cameras
     project_fn = os.path.join(out_fol, job_name + '.psx') # Metashape project
     alignment_dir = os.path.join(out_fol, 'aligned_photos')
-    # step 4: generate point cloud, DEM, and orthomosaic
+    # step 3: generate point cloud, DEM, and orthomosaic
     sfm_dir = os.path.join(out_fol, 'sfm')
-    # step 5: coregistration with reference DEM
+    # step 4: coregistration with reference DEM
     coreg_dir = os.path.join(out_fol, 'coregistration')
-    # step 6: plot figure of results
-    final_figure_fn = os.path.join(out_fol, f"{job_name}_result.jpg")
+    # step 5: plot results figure
+    final_figure_fn = os.path.join(out_fol, job_name + '.png')
 
     # Create output directory
     os.makedirs(out_fol, exist_ok=True)
@@ -134,7 +134,7 @@ def main():
         print('\n----------------------------------------')
         print('BUILD POINT CLOUD, DEM, AND ORTHOMOSAIC')
         print('----------------------------------------\n')
-        pc_fn, dem_fn, ortho_fn = ms_utils.build_dem(
+        dem_fn, ortho_fn = ms_utils.build_dem(
             project_fn, 
             dem_resolution = 2,
             out_dir = sfm_dir
@@ -160,13 +160,13 @@ def main():
         else:
             refdem_fn = refdem
         # Coregister
-        dem_fn, ortho_fn = workflow.coregister_dems_xdem(
+        workflow.coregister_dems_xdem(
             dem_fn = dem_fn, 
             refdem_fn = refdem_fn,
             ortho_fn = ortho_fn,
             out_dir = coreg_dir
         )
-    elif coregister:
+    if coregister:
         dem_fn = glob(os.path.join(coreg_dir, '*DEM*coregistered.tif'))[0]
         ortho_fn = glob(os.path.join(coreg_dir, '*ortho*coregistered.tif'))[0]
 
