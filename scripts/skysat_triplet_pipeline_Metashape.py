@@ -10,21 +10,21 @@ from glob import glob
 from skysat_stereo_snow import skysat_stereo_workflow as workflow
 from skysat_stereo_snow import metashape_utils as ms_utils
 from skysat_stereo_snow import query_refdem_utils as refdem_utils
-from typing import List
 
 def getparser():
-    parser = argparse.ArgumentParser(description='Wrapper script to run full triplet stereo to DEM workflow')
+    parser = argparse.ArgumentParser(description='Wrapper script to run full triplet stereo to DEM workflow.',
+                                     formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('-img_folder', default=None, type=str, help='Path to folder containing L1B TOAR imagery.')
-    parser.add_argument('-masks', default=None, type=List, help='Masks to apply to images before constructing DEM. Options:'
-                        '\n\t"cloud", "cloud_shadow", "light_haze", "snow": UDM2-based mask options (files must be in img_folder)'
-                        '\n\t"water_check": Additional option where NDWI thresholding is used to remove images with > 99% water from analysis.')
-    parser.add_argument('-coregister', default=False, type=bool, help='Whether to coregister the resulting DEM to a reference DEM. "refdem" must be specified.')
+    parser.add_argument('-masks', default=[], nargs='+', help='Masks to apply to images before constructing DEM. Options:'
+                        '\n\t- "cloud", "cloud_shadow", "light_haze", "snow": UDM2-based mask options (files must be in img_folder)'
+                        '\n\t- "water_check": NDWI thresholding is used to remove images with > 99 percent water from analysis.')
+    parser.add_argument('-coregister', default=0, type=int, choices=[1,0], help='Whether to coregister the resulting DEM to a reference DEM. "refdem" must be specified.')
     parser.add_argument('-refdem', default=None, type=str, help='Reference DEM to use in coregistration. Several options available:'
                         '\n\t- Path to file in directory'
                         '\n\t- Name of DEM to query, clip, and download from Google Earth Engine: "ArcticDEM", "REMA", "COPDEM"')
     parser.add_argument('-job_name', default=None, type=str, help='Identifier for output folder and final composite products.')
     parser.add_argument('-out_folder',default=None,type=str,help='path to output folder to save results in')
-    parser.add_argument('-full_workflow', choices=[1,0], type=int, default=1, help='Specify 1 to run full workflow (default: %(default)s)')
+    parser.add_argument('-full_workflow', choices=[1,0], type=int, default=1, help='Specify 1 to run full workflow')
     parser.add_argument('-partial_workflow_steps', nargs='+', default=None, help='Specify steps of workflow to run.' 
                         '\n\t1 = Mask images'
                         '\n\t2 = Align photos'
@@ -105,7 +105,7 @@ def main():
     # ------- RUN THE STEPS --------
     # ------------------------------
 
-    if (1 in steps2run) & masks:
+    if (1 in steps2run) & (len(masks) > 0):
         print('\n----------------------------------------')
         print('APPLY MASKS TO IMAGES:', masks)
         print('----------------------------------------\n')
