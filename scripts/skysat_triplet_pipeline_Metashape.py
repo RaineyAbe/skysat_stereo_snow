@@ -57,7 +57,7 @@ def main():
     # ------ CHECK INPUT FILES -----
     # ------------------------------
 
-    img_list = sorted(glob(os.path.join(img_folder,f'*_basic_analytic.tif')))
+    img_list = sorted(glob(os.path.join(img_folder,f'*analytic.tif')))
     if len(img_list)<2:
         raise Exception(f"Only {len(img_list)} TOAR images detected, exiting")
     else:
