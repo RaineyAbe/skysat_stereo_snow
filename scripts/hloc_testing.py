@@ -21,6 +21,7 @@ from scipy.spatial.transform import Rotation
 import pycolmap
 import h5py
 from hloc import extract_features, match_features
+from typing import Tuple, Dict
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -332,95 +333,95 @@ def get_image_specs(
     return specs_df
 
 
-def write_rig_config(specs_df, tsai_dir, out_file):
-    print("\nConstructing rig configuration file.")
-    rigs = []
+# def write_rig_config(specs_df, tsai_dir, out_file):
+#     print("\nConstructing rig configuration file.")
+#     rigs = []
 
-    # Group by rig ("sat" column)
-    for rig_name, rig_df in specs_df.groupby("sat"):
-        print(f"\tProcessing rig: {rig_name}")
+#     # Group by rig ("sat" column)
+#     for rig_name, rig_df in specs_df.groupby("sat"):
+#         print(f"\tProcessing rig: {rig_name}")
 
-        # --- Find a reference group of images (same frame, all rig cameras) ---
-        print("\tIdentifying a reference image group for relative poses.")
-        # Note: Corrected to find required sensors per rig, not from the global df
-        required_sensors = set(rig_df["cam"].unique())
-        grouper = ["datetime", "sat", "frame"]
+#         # --- Find a reference group of images (same frame, all rig cameras) ---
+#         print("\tIdentifying a reference image group for relative poses.")
+#         # Note: Corrected to find required sensors per rig, not from the global df
+#         required_sensors = set(rig_df["cam"].unique())
+#         grouper = ["datetime", "sat", "frame"]
 
-        # Filter groups to find one that contains every sensor for this specific rig
-        valid_groups = rig_df.groupby(grouper).filter(lambda g: set(g["cam"]) == required_sensors)
-        if valid_groups.empty:
-            print(f"\tERROR: Could not find a single frame containing all {len(required_sensors)} sensors for rig '{rig_name}'.")
-            print("\tCannot calculate relative poses for this rig. Skipping.")
-            continue
+#         # Filter groups to find one that contains every sensor for this specific rig
+#         valid_groups = rig_df.groupby(grouper).filter(lambda g: set(g["cam"]) == required_sensors)
+#         if valid_groups.empty:
+#             print(f"\tERROR: Could not find a single frame containing all {len(required_sensors)} sensors for rig '{rig_name}'.")
+#             print("\tCannot calculate relative poses for this rig. Skipping.")
+#             continue
         
-        # Take the first complete group as our reference for poses
-        example_key, example_group = next(iter(valid_groups.groupby(grouper)))
-        example_group = example_group.sort_values("cam").reset_index(drop=True)
-        print(f"\tMatched group for relative poses: {example_key}")
+#         # Take the first complete group as our reference for poses
+#         example_key, example_group = next(iter(valid_groups.groupby(grouper)))
+#         example_group = example_group.sort_values("cam").reset_index(drop=True)
+#         print(f"\tMatched group for relative poses: {example_key}")
 
-        # --- Get absolute poses (R, C) for the reference group ---
-        absolute_poses = {}
-        for _, row in example_group.iterrows():
-            tsai_path = Path(tsai_dir) / (Path(row["image_file"]).stem + ".tsai")
-            if not tsai_path.exists():
-                raise FileNotFoundError(f"\tTSAI file not found for {row['image_file']}")
+#         # --- Get absolute poses (R, C) for the reference group ---
+#         absolute_poses = {}
+#         for _, row in example_group.iterrows():
+#             tsai_path = Path(tsai_dir) / (Path(row["image_file"]).stem + ".tsai")
+#             if not tsai_path.exists():
+#                 raise FileNotFoundError(f"\tTSAI file not found for {row['image_file']}")
             
-            # The R matrix from parse_tsai is a flat array, so reshape it
-            _, R_flat, C = parse_tsai(tsai_path)
-            absolute_poses[row["cam"]] = (R_flat.reshape(3, 3), C)
+#             # The R matrix from parse_tsai is a flat array, so reshape it
+#             _, R_flat, C = parse_tsai(tsai_path)
+#             absolute_poses[row["cam"]] = (R_flat.reshape(3, 3), C)
 
-        # --- Determine the reference sensor and get its absolute pose ---
-        ref_sensor_name = rig_df["cam"].value_counts().idxmax()
-        print(f"\tUsing sensor '{ref_sensor_name}' as reference for rig.")
-        R_ref, C_ref = absolute_poses[ref_sensor_name]
+#         # --- Determine the reference sensor and get its absolute pose ---
+#         ref_sensor_name = rig_df["cam"].value_counts().idxmax()
+#         print(f"\tUsing sensor '{ref_sensor_name}' as reference for rig.")
+#         R_ref, C_ref = absolute_poses[ref_sensor_name]
 
-        # --- Build the camera dictionaries for the rig ---
-        rig_cameras = []
-        # Use the unique sensors from the rig_df to build the final list
-        for sensor_name in sorted(rig_df["cam"].unique()):
-            sensor_df = rig_df[rig_df["cam"] == sensor_name]
-            first_image = sensor_df.iloc[0]
-            tsai_path = Path(tsai_dir) / (Path(first_image["image_file"]).stem + ".tsai")
+#         # --- Build the camera dictionaries for the rig ---
+#         rig_cameras = []
+#         # Use the unique sensors from the rig_df to build the final list
+#         for sensor_name in sorted(rig_df["cam"].unique()):
+#             sensor_df = rig_df[rig_df["cam"] == sensor_name]
+#             first_image = sensor_df.iloc[0]
+#             tsai_path = Path(tsai_dir) / (Path(first_image["image_file"]).stem + ".tsai")
             
-            intrinsics, _, _ = parse_tsai(tsai_path)
-            fx, fy, cx, cy = intrinsics
-            prefix_path = Path(first_image["sat"]) / first_image["cam"]
+#             intrinsics, _, _ = parse_tsai(tsai_path)
+#             fx, fy, cx, cy = intrinsics
+#             prefix_path = Path(first_image["sat"]) / first_image["cam"]
             
-            cam_dict = {
-                "image_prefix": str(prefix_path),
-                "ref_sensor": sensor_name == ref_sensor_name,
-                "camera_model_name": "PINHOLE",
-                "camera_params": [fx, fy, cx, cy],
-            }
+#             cam_dict = {
+#                 "image_prefix": str(prefix_path),
+#                 "ref_sensor": sensor_name == ref_sensor_name,
+#                 "camera_model_name": "PINHOLE",
+#                 "camera_params": [fx, fy, cx, cy],
+#             }
 
-            # If not the reference sensor, calculate and add its relative pose
-            if not cam_dict["ref_sensor"]:
-                R_cam, C_cam = absolute_poses[sensor_name]
+#             # If not the reference sensor, calculate and add its relative pose
+#             if not cam_dict["ref_sensor"]:
+#                 R_cam, C_cam = absolute_poses[sensor_name]
 
-                # R_rel = R_ref * R_cam^T
-                R_rel = R_ref @ R_cam.T
+#                 # R_rel = R_ref * R_cam^T
+#                 R_rel = R_ref @ R_cam.T
                 
-                # t_rel = R_ref * (C_cam - C_ref)
-                t_rel = R_ref @ (C_cam - C_ref)
+#                 # t_rel = R_ref * (C_cam - C_ref)
+#                 t_rel = R_ref @ (C_cam - C_ref)
 
-                # Convert rotation matrix to quaternion [qw, qx, qy, qz]
-                # scipy returns [x, y, z, w], so we need to reorder for COLMAP
-                quat_scipy = Rotation.from_matrix(R_rel).as_quat()
-                quat_colmap = [quat_scipy[3], quat_scipy[0], quat_scipy[1], quat_scipy[2]]
+#                 # Convert rotation matrix to quaternion [qw, qx, qy, qz]
+#                 # scipy returns [x, y, z, w], so we need to reorder for COLMAP
+#                 quat_scipy = Rotation.from_matrix(R_rel).as_quat()
+#                 quat_colmap = [quat_scipy[3], quat_scipy[0], quat_scipy[1], quat_scipy[2]]
 
-                cam_dict["cam_from_rig_rotation"] = quat_colmap
-                cam_dict["cam_from_rig_translation"] = t_rel.tolist()
+#                 cam_dict["cam_from_rig_rotation"] = quat_colmap
+#                 cam_dict["cam_from_rig_translation"] = t_rel.tolist()
             
-            rig_cameras.append(cam_dict)
+#             rig_cameras.append(cam_dict)
 
-        rigs.append({"cameras": rig_cameras})
+#         rigs.append({"cameras": rig_cameras})
 
-    # Write JSON
-    with open(out_file, "w") as f:
-        json.dump(rigs, f, indent=4)
+#     # Write JSON
+#     with open(out_file, "w") as f:
+#         json.dump(rigs, f, indent=4)
 
-    print(f"Rig configuration saved to {out_file}")
-    return
+#     print(f"Rig configuration saved to {out_file}")
+#     return
 
 
 def configure_reconstruction(specs_df, tsai_dir, image_dir, out_dir):
@@ -492,6 +493,12 @@ def configure_reconstruction(specs_df, tsai_dir, image_dir, out_dir):
                 R_cam, C_cam = absolute_poses[sensor_name]
                 R_rel = R_ref @ R_cam.T
                 t_rel = R_ref @ (C_cam - C_ref)
+
+                print("\n\tSensor name:", sensor_name)
+                R_rel_xyzw = Rotation.from_matrix(R_rel).as_quat()
+                print("\tRelative rotation:", R_rel_xyzw)
+                print("\tRelative translation:", t_rel, "\n")
+
                 relative_pose = pycolmap.Rigid3d(
                     rotation=pycolmap.Rotation3d(R_rel), 
                     translation=t_rel
@@ -567,72 +574,190 @@ def configure_reconstruction(specs_df, tsai_dir, image_dir, out_dir):
     return rec
 
 
+def get_keypoints_from_h5(features_path: Path, name: str) -> np.ndarray:
+    with h5py.File(str(features_path), 'r') as hfile:
+        keypoints = hfile[name]['keypoints'].__array__()
+    return keypoints
+
+
+def get_matches_from_h5(matches_path: Path, name0: str, name1: str) -> np.ndarray:
+    # HLOC sanitizes names by replacing '/' with '-' before using them as keys.
+    s_name0 = name0.replace("/", "-")
+    s_name1 = name1.replace("/", "-")
+
+    with h5py.File(str(matches_path), 'r') as hfile:
+        # Check for the pair in both possible orders.
+        if s_name0 in hfile and s_name1 in hfile[s_name0]:
+            pair_group = hfile[s_name0][s_name1]
+            reverse = False
+        elif s_name1 in hfile and s_name0 in hfile[s_name1]:
+            pair_group = hfile[s_name1][s_name0]
+            reverse = True
+        else:
+            # No matches found for this pair
+            return np.array([[], []]).T
+        
+        matches = pair_group['matches0'].__array__()
+
+    # Convert the HLOC format (implicit index) to COLMAP's Nx2 format
+    idx = np.where(matches != -1)[0]
+    matches_colmap = np.stack([idx, matches[idx]], axis=-1)
+    
+    if reverse:
+        matches_colmap = np.flip(matches_colmap, axis=-1)
+        
+    return matches_colmap
+
+
 def populate_database_from_hloc(
     recon: pycolmap.Reconstruction,
-    db: pycolmap.Database,  # <-- MODIFIED: Takes a pycolmap.Database object
+    database_path: Path,
     features_path: Path,
     matches_path: Path,
-    pairs_path: Path,
-):
-    """
-    Populates an OPEN pycolmap.Database with the model structure, features, 
-    and verified matches, mirroring the logic of hloc.triangulation.
-    """
-    print("Populating database with HLOC features and matches...")
-
+    pairs_path: Path
+    ):
+    print("\nPopulating Database...")
     image_ids = {image.name: image.image_id for image in recon.images.values()}
     
-    # The 'with' statement is now REMOVED from this function.
-    # The calling function (`main`) is responsible for managing the connection.
+    with pycolmap.Database.open(database_path) as db:
+        # Import model structure
+        for cam_id, camera in tqdm(recon.cameras.items(), desc="Writing cameras"):
+            db.write_camera(camera, use_camera_id=True)
+        for rig_id, rig in tqdm(recon.rigs.items(), desc="Writing rigs"):
+            db.write_rig(rig, use_rig_id=True)
+        for frame_id, frame in tqdm(recon.frames.items(), desc="Writing frames"):
+            db.write_frame(frame, use_frame_id=True)
+        for img_id, image in tqdm(recon.images.items(), desc="Writing images"):
+            db.write_image(image, use_image_id=True)
 
-    # 1. Write the complete model structure to the database.
-    print("Writing complete model structure to the database...")
-    for cam_id, camera in recon.cameras.items():
-        db.write_camera(camera, use_camera_id=True)
-    for rig_id, rig in recon.rigs.items():
-        db.write_rig(rig, use_rig_id=True)
-    for frame_id, frame in recon.frames.items():
-        db.write_frame(frame, use_frame_id=True)
-    for img_id, image in recon.images.items():
-        db.write_image(image, use_image_id=True)
-
-    # 2. Import Features.
-    print("Importing features into the database...")
-    with h5py.File(features_path, 'r') as features:
+        # Import features
         for image_name, image_id in tqdm(image_ids.items(), desc="Writing features"):
-            if image_name not in features: continue
-            keypoints = features[image_name]['keypoints'].__array__()
-            keypoints += 0.5
-            db.write_keypoints(image_id, keypoints)
+            try:
+                # Use our new, correct helper function
+                keypoints = get_keypoints_from_h5(features_path, image_name)
+                keypoints += 0.5  # Convert to COLMAP's pixel-center convention
+                db.write_keypoints(image_id, keypoints)
+            except KeyError:
+                print(f"Warning: Could not find features for {image_name}")
+                continue
 
-    # 3. Import Matches.
-    print("Importing matches into the database...")
-    with open(str(pairs_path), "r") as f:
-        pairs = [p.split() for p in f.readlines()]
+        with open(str(pairs_path), "r") as f:
+            pairs = [p.split() for p in f.readlines()]
 
-    matched = set()
-    with h5py.File(matches_path, 'r') as matches:
+        matched = set()
         for name0, name1 in tqdm(pairs, desc="Writing matches"):
-            if name0 not in image_ids or name1 not in image_ids: continue
+            # Check if image pair exists in reconstruction and has matches
+            if name0 not in image_ids or name1 not in image_ids: 
+                continue
             id0, id1 = image_ids[name0], image_ids[name1]
-            if len({(id0, id1), (id1, id0)} & matched) > 0: continue
+            if len({(id0, id1), (id1, id0)} & matched) > 0: 
+                continue
             
-            pair_key = '/'.join(sorted((name0, name1)))
-            if pair_key not in matches: continue
+            matches = get_matches_from_h5(matches_path, name0, name1)
+            if len(matches) == 0: 
+                continue
 
-            hloc_matches = matches[pair_key]['matches0'].__array__()
-            kp_indices0 = np.arange(len(hloc_matches))
-            valid_mask = hloc_matches != -1
-            db_matches = np.stack([kp_indices0[valid_mask], hloc_matches[valid_mask]], axis=-1)
-
-            db.write_matches(id0, id1, db_matches)
+            # Write matches to database
+            db.write_matches(id0, id1, matches)
             matched |= {(id0, id1), (id1, id0)}
-
-            tg = pycolmap.TwoViewGeometry(inlier_matches=db_matches)
+            
+            # Write the two-view geometry
+            tg = pycolmap.TwoViewGeometry(inlier_matches=matches)
             db.write_two_view_geometry(id0, id1, tg)
 
-    print("Database population finished.")
+        # Print Database summary 
+        # similar to the pycolmap.Reconstruction.summary() method 
+        # (that doesn't exist for pycolmap.Database)
+        print("\nDatabase:")
+        print("\tnum_rigs:", db.num_rigs())
+        print("\tnum_cameras:", db.num_cameras())
+        print("\tnum_frames:", db.num_frames())
+        print("\tnum_images:", db.num_images())
+        print("\tnum_pose_priors:", db.num_pose_priors())
+        print("\tnum_keypoints:", db.num_keypoints())
+        print("\tnum_matches:", db.num_matches())
+        print("\tnum_matched_image_pairs:", db.num_matched_image_pairs())
+
     return
+
+
+def has_positive_depth(projection_matrix: np.ndarray, point3D: np.ndarray) -> bool:
+    point3D_h = np.append(point3D, 1.0)
+    depth = projection_matrix[2].dot(point3D_h)
+    return depth > 0
+
+
+# def bootstrap_reconstruction(
+#     recon: pycolmap.Reconstruction,
+#     database_path: Path,
+#     pairs_path: Path,
+#     min_tri_angle_deg: float = 0.5,
+# ) -> pycolmap.Reconstruction:
+
+#     print("\nBootstrapping the reconstruction with manual triangulation...")
+
+#     min_tri_angle_rad = np.deg2rad(min_tri_angle_deg)
+    
+#     # Get the first image pair
+#     print(f"Searching for a valid initial pair in {pairs_path}...")
+#     image_id1, image_id2 = None, None
+#     initial_pair_name0, initial_pair_name1 = None, None
+#     with open(str(pairs_path), "r") as f:
+#         for line in f:
+#             name0, name1 = line.strip().split()
+#             img1 = recon.find_image_with_name(name0)
+#             img2 = recon.find_image_with_name(name1)
+            
+#             if img1 is not None and img2 is not None:
+#                 image_id1, image_id2 = img1.image_id, img2.image_id
+#                 initial_pair_name0, initial_pair_name1 = name0, name1
+#                 print(f"Found valid initial pair: {name0} (ID {image_id1}) and {name1} (ID {image_id2})")
+#                 break
+    
+#     if image_id1 is None:
+#         raise RuntimeError("Could not find any valid image pairs from the pairs file in the reconstruction.")
+
+#     image1 = recon.images[image_id1]
+#     image2 = recon.images[image_id2]
+#     cam1 = recon.cameras[image1.camera_id]
+#     cam2 = recon.cameras[image2.camera_id]
+
+#     # Get poses and projection matrices from our trusted reconstruction
+#     proj_matrix1 = image1.cam_from_world().matrix()
+#     proj_matrix2 = image2.cam_from_world().matrix()
+#     proj_center1 = image1.projection_center()
+#     proj_center2 = image2.projection_center()
+
+#     with pycolmap.Database.open(database_path) as db:
+#         matches = db.read_matches(image_id1, image_id2)
+#         kps1 = db.read_keypoints(image_id1)
+#         kps2 = db.read_keypoints(image_id2)
+
+#     print(f"Found {len(matches)} matches between initial pair {image1.name} and {image2.name}.")
+#     if len(matches) == 0:
+#         print("Warning: No matches found for the initial pair. The pipeline might fail.")
+#         return recon
+
+#     num_added_points = 0
+#     for kp_idx1, kp_idx2 in tqdm(matches, desc="Manual Triangulation"):
+#         point1_N = cam1.cam_from_img(kps1[kp_idx1])
+#         point2_N = cam2.cam_from_img(kps2[kp_idx2])
+#         xyz = pycolmap.triangulate_point(proj_matrix1, proj_matrix2, point1_N, point2_N)
+#         tri_angle = pycolmap.calculate_triangulation_angle(proj_center1, proj_center2, xyz)
+
+#         if (
+#             (tri_angle >= min_tri_angle_rad) # meets triangulation angle threshold
+#             and (has_positive_depth(proj_matrix1, xyz)) # point is in front of camera 1
+#             and (has_positive_depth(proj_matrix2, xyz)) # point is in front of camera 2
+#             ):
+#             track = pycolmap.Track()
+#             track.add_element(image_id1, kp_idx1)
+#             track.add_element(image_id2, kp_idx2)
+#             recon.add_point3D(xyz, track)
+#             num_added_points += 1
+            
+#     print(f"Added {num_added_points} initial 3D points to the reconstruction.")
+#     return recon
 
 
 def main():
@@ -760,67 +885,83 @@ def main():
     #     overwrite=True
     # )
 
-    # ----------------------------------------
-    # 7. CREATE AND POPULATE THE DATABASE
-    # ----------------------------------------
-    print("\n--- 7. Creating and populating database from HLOC output ---")
-    if database_path.exists():
-        database_path.unlink()
+    # # ----------------------------------------
+    # # 7. CREATE AND POPULATE THE DATABASE
+    # # ----------------------------------------
+    # print("\n--- 7. Creating and populating database from rig configuration and HLOC outputs ---")
+    # if database_path.exists():
+    #     database_path.unlink()
     
-    # Use a 'with' block here to manage the database connection
-    with pycolmap.Database.open(database_path) as db:
-        
-        populate_database_from_hloc(
-            recon=recon,
-            db=db,
-            features_path=features_file,
-            matches_path=matches_file,
-            pairs_path=sfm_pairs_file
-        )
+    # populate_database_from_hloc(
+    #     recon=recon,
+    #     database_path=database_path,
+    #     features_path=features_file,
+    #     matches_path=matches_file,
+    #     pairs_path=sfm_pairs_file
+    # )
 
-        # Your debugging prints will now work correctly inside this block
-        print("\n--- Verifying database contents ---")
-        print("db.num_keypoints:", db.num_keypoints())
-        print("db.num_matches:", db.num_matches())
-        print("db.num_matched_image_pairs:", db.num_matched_image_pairs())
+    # # ----------------------------------------
+    # # 8. TRIANGULATE POINTS
+    # # ----------------------------------------
+    # print("\n--- 8. Triangulating points using the IncrementalTriangulator ---")
 
-    # ----------------------------------------
-    # 8. TRIANGULATE POINTS
-    # ----------------------------------------
-    print("\n--- 8. Triangulating points using initial poses and database matches ---")
-    
-    # The rest of the script is now guaranteed to work because the database
-    # was created and populated correctly.
-    populated_recon = pycolmap.triangulate_points(
-        reconstruction=recon,
-        database_path=str(database_path),
-        image_path=str(new_image_folder),
-        output_path=str(recon_folder / "triangulated"),
-        clear_points=True
-    )
-    
-    print("\nAfter triangulation:")
-    print(populated_recon.summary())
+    # # 1. Open the database that we populated in the previous step.
+    # print("Opening database...")
+    # with pycolmap.Database.open(database_path) as db:
 
-    # ----------------------------------------
-    # 9. RUN BUNDLE ADJUSTMENT
-    # ----------------------------------------
-    print("\n--- 9. Running Bundle Adjustment to refine cameras and points ---")
-    # Define configuration
-    ba_config = pycolmap.BundleAdjustmentOptions()
-    ba_config.loss_function_type = pycolmap.LossFunctionType.CAUCHY
-    ba_config.refine_focal_length = False
-    ba_config.refine_principal_point = False
-    ba_config.refine_extra_params = False
-    ba_config.refine_rig_from_world = True
-    ba_config.refine_sensor_from_rig = True
-    ba_config.use_gpu = False
-    ba_config.print_summary = True
-    print(f"Bundle adjust configuration settings:\n{ba_config.todict()}")
+    #     # 2. Create the DatabaseCache from the open database object.
+    #     # This reads all data and builds the correspondence graph in memory.
+    #     print("Loading database into cache...")
+    #     db_cache = pycolmap.DatabaseCache.create(
+    #         database=db,
+    #         min_num_matches=15,
+    #         ignore_watermarks=False,
+    #         image_names=set(recon.images[i].name for i in recon.reg_image_ids()),
+    #     )
+    #     print("\nCorrespondence graph:", db_cache.correspondence_graph.num_correspondences_between_all_images())
 
-    pycolmap.bundle_adjustment(populated_recon, options=ba_config)
-    print("\nAfter bundle adjustment:")
-    print(populated_recon.summary())
+    #     # 3. Load keypoints from the cache into the reconstruction.
+    #     # This populates the in-memory `recon` object and solves the original IndexError.
+    #     print("Synchronizing reconstruction with database cache...")
+    #     recon.load(db_cache)
+
+    #     # 4. Create the IncrementalTriangulator.
+    #     print("Creating the incremental triangulator...")
+    #     triangulator = pycolmap.IncrementalTriangulator(db_cache.correspondence_graph, recon)
+
+    #     # 5. Define lenient triangulation options.
+    #     tri_options = pycolmap.IncrementalTriangulatorOptions()
+    #     tri_options.create_max_angle_error = 5.0
+    #     # tri_options.max_reproj_error = 10.0
+    #     # tri_options.min_tri_angle = 0.5
+    #     tri_options.ignore_two_view_tracks = False
+
+    #     # 6. Loop through all registered images and triangulate their points.
+    #     for image_id in tqdm(recon.reg_image_ids(), desc="Triangulating images"):
+    #         triangulator.triangulate_image(tri_options, image_id)
+                
+    # print("\nAfter triangulation:")
+    # print(recon.summary())
+
+    # # ----------------------------------------
+    # # 9. RUN BUNDLE ADJUSTMENT
+    # # ----------------------------------------
+    # print("\n--- 9. Running Bundle Adjustment to refine cameras and points ---")
+    # # Define configuration
+    # ba_config = pycolmap.BundleAdjustmentOptions()
+    # ba_config.loss_function_type = pycolmap.LossFunctionType.CAUCHY
+    # ba_config.refine_focal_length = False
+    # ba_config.refine_principal_point = False
+    # ba_config.refine_extra_params = False
+    # ba_config.refine_rig_from_world = True
+    # ba_config.refine_sensor_from_rig = True
+    # ba_config.use_gpu = False
+    # ba_config.print_summary = True
+    # # print(f"Bundle adjust configuration settings:\n{ba_config.todict()}")
+
+    # pycolmap.bundle_adjustment(recon, options=ba_config)
+    # print("\nAfter bundle adjustment:")
+    # print(recon.summary())
 
     # ----------------------------------------
     # 10. EXPORT REFINED DATA
