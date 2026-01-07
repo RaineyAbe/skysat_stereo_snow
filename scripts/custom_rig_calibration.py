@@ -20,6 +20,8 @@ import cv2
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
 import time
+import ast
+from datetime import datetime
 
 # Add path to the Ames Stereo Pipeline
 asp_path = "/Users/rdcrlrka/Research/StereoPipeline-3.6.0-2025-12-31-arm64-OSX/bin"
@@ -77,6 +79,44 @@ def parse_image_specs(image_name: str) -> pd.DataFrame:
         "cam": "".join(parts[2].partition('d')[1:]),
         "frame": parts[3]
     }, index=[0])
+
+
+def save_cam_specs(df: pd.DataFrame, out_file: str):
+    df_to_save = df.copy()
+
+    # Define a function to convert an array to its list string representation
+    # e.g., np.array([[1, 2], [3, 4]]) -> '[[1, 2], [3, 4]]'
+    def array_to_list_str(arr):
+        return str(arr.tolist())
+
+    # Apply the conversion to each array column
+    for col in ['K', 'R', 't']:
+        if col in df_to_save.columns:
+            df_to_save[col] = df_to_save[col].apply(array_to_list_str)
+
+    df_to_save.to_csv(out_file, index=False)
+    print(f"Saved camera specs to:\n{out_file}")
+    return
+
+
+def load_cam_specs(filename: str) -> pd.DataFrame:
+    df = pd.read_csv(filename)
+    def str_to_array(s):
+        try:
+            # Safely evaluate the string to a Python list
+            py_list = ast.literal_eval(s)
+            # Convert the list to a NumPy array
+            return np.array(py_list)
+        except (ValueError, SyntaxError) as e:
+            print(f"Error parsing string to array: {s}. Error: {e}")
+            return np.array([])
+    # Apply the parsing function to each column
+    for col in ['K', 'R', 't']:
+        if col in df.columns:
+            df[col] = df[col].apply(str_to_array)
+    return df
+
+
 
 ###############################
 # CAMERA AND RIG PREPROCESSING
@@ -183,7 +223,7 @@ def opencv_cameras_to_asp_pinhole(
         output_filename = os.path.join(out_folder, f"{image_name}.tsai")
         with open(output_filename, 'w') as f:
             f.write(f"VERSION_4\n")
-            f.write("fPINHOLE\n")
+            f.write(f"PINHOLE\n")
             f.write(f"fu = {fu}\n")
             f.write(f"fv = {fv}\n")
             f.write(f"cu = {cu}\n")
@@ -255,13 +295,17 @@ def identify_stereo_pairs(
     for img1, img2 in tqdm(combinations, desc="Finding pairs"):
         overlap = polygons[img1].intersection(polygons[img2]).area / min(polygons[img1].area, polygons[img2].area) * 100
         if overlap >= overlap_perc:
-            if true_stereo and '_'.join(os.path.basename(img1).split('_')[0:2]) == '_'.join(os.path.basename(img2).split('_')[0:2]):
+            if true_stereo and ('_'.join(os.path.basename(img1).split('_')[0:2]) == '_'.join(os.path.basename(img2).split('_')[0:2])):
                 continue
             bh_ratio = calculate_baseline_to_height_ratio(img1, img2, utm_epsg)
             if bh_ratio_range[0] <= bh_ratio <= bh_ratio_range[1]:
+                dt1 = "_".join(os.path.splitext(os.path.basename(img1))[0].split("_")[0:2])
+                dt2 = "_".join(os.path.splitext(os.path.basename(img2))[0].split("_")[0:2])
+                dt_identifier = f"{dt1}__{dt2}"
                 stereo_pairs.append({
                     "img1": os.path.basename(img1) if write_basename else img1,
                     "img2": os.path.basename(img2) if write_basename else img2,
+                    "datetime_identifier": dt_identifier,
                     "overlap_percent": overlap,
                     "bh_ratio": bh_ratio
                 })
@@ -275,6 +319,142 @@ def identify_stereo_pairs(
 # FEATURE EXTRACTION AND MATCHING
 ###############################
 
+# ASP
+def get_stereo_opts(
+        session: str = None, 
+        threads: int = None, 
+        texture: str = 'normal', 
+        stop_point: int = -1, 
+        unalign_disparity: bool = False
+        ):
+    stereo_opts = []
+    # session_args
+    if session:
+        stereo_opts.extend(['-t', session])
+    stereo_opts.extend(['--threads-multiprocess', str(threads)])
+    stereo_opts.extend(['--threads-singleprocess', str(threads)])
+
+    # stereo_pprc args : This is for preprocessing (adjusting image dynamic range, etc.)
+    stereo_opts.extend(['--individually-normalize'])
+    stereo_opts.extend(['--ip-per-tile', '8000'])
+    stereo_opts.extend(['--ip-num-ransac-iterations','2000'])
+    stereo_opts.extend(['--force-reuse-match-files'])
+    stereo_opts.extend(['--skip-rough-homography'])
+    stereo_opts.extend(["--alignment-method", "none"])
+    # mask out completely feature less area using a std filter, to avoid gross MGM errors
+    # this is experimental and needs more testing
+    stereo_opts.extend(['--stddev-mask-thresh', '0.5'])
+    stereo_opts.extend(['--stddev-mask-kernel', '-1'])
+    # stereo_corr_args
+    stereo_opts.extend(['--stereo-algorithm', 'asp_mgm'])
+    # correlation kernel size depends on the texture
+    if texture=='low':
+        stereo_opts.extend(['--corr-kernel', '9', '9'])
+    elif texture=='normal':
+        stereo_opts.extend(['--corr-kernel', '7', '7'])
+    stereo_opts.extend(['--corr-tile-size', '1024'])
+    stereo_opts.extend(['--cost-mode', '4'])
+    stereo_opts.extend(['--corr-max-levels', '5'])
+    # stereo_rfne_args:
+    stereo_opts.extend(['--subpixel-mode', '9'])
+    if texture=='low':
+        stereo_opts.extend(['--subpixel-kernel', '21', '21'])
+    elif texture=='normal':
+        stereo_opts.extend(['--subpixel-kernel', '15', '15'])
+    stereo_opts.extend(['--xcorr-threshold', '2'])
+    stereo_opts.extend(['--num-matches-from-disparity', '10000'])
+    # add stopping point if specified
+    if stop_point!=-1:
+        stereo_opts.extend(['--stop-point', str(stop_point)])
+    # get the disparity map without any alignment
+    if unalign_disparity:
+        stereo_opts.extend(['--unalign-disparity'])
+    
+    return stereo_opts
+
+
+def run_stereo(
+        stereo_pairs_fn: str = None, 
+        cam_list: list[str] = None, 
+        dem_file: str = None,
+        out_folder: str = None, 
+        session: str = None,
+        texture: str = 'normal', 
+        stop_point: int = -1,
+        verbose: bool = True,
+        threads: int = int(os.cpu_count() * 0.75)
+        ) -> None:
+    # Check if output folder exists
+    if not os.path.exists(out_folder):
+        os.makedirs(out_folder)
+    
+    # Load the stereo pairs
+    stereo_pairs_df = pd.read_csv(stereo_pairs_fn, sep=' ', header=0)
+
+    # Determine number of CPUs for parallelization and threads per job
+    ncpu, threads_per_job = setup_parallel_jobs(total_jobs=len(stereo_pairs_df), num_cpu=threads)
+    
+    # Define stereo arguments
+    stereo_opts = get_stereo_opts(
+        session=session, 
+        threads=threads_per_job, 
+        texture=texture, 
+        stop_point=stop_point
+        )
+    
+    # Create jobs list for each stereo pair
+    job_list = []
+    for _, row in stereo_pairs_df.iterrows():
+        # Determine output folder for stereo job
+        IMG1 = os.path.splitext(os.path.basename(row['img1']))[0]
+        IMG2 = os.path.splitext(os.path.basename(row['img2']))[0]
+        out_prefix = os.path.join(out_folder, row['datetime_identifier'], IMG1 + '__' + IMG2, 'run')  
+
+        # Construct the stereo job
+        if cam_list:
+            cam1 = [x for x in cam_list if IMG1 in x][0]
+            cam2 = [x for x in cam_list if IMG2 in x][0]
+            job = stereo_opts + [row['img1'], row['img2'], cam1, cam2, out_prefix]
+        else:
+            # Otherwise, use the images directly
+            stereo_args = [row['img1'], row['img2'], out_prefix]
+            job = stereo_opts + stereo_args
+        # add DEM last
+        if dem_file:
+            job += [dem_file]
+
+        # Add job to list of jobs
+        job_list.append(job)
+
+    if verbose:
+        print('stereo arguments for first job:')
+        print(job_list[0])
+    
+    # Run the jobs in parallel
+    stereo_logs = p_map(run_cmd, ['parallel_stereo']*len(job_list), job_list, num_cpus=ncpu)
+
+    # Save the consolidated log
+    stereo_log_fn = os.path.join(out_folder, 'stereo_log.log')
+    with open(stereo_log_fn, 'w') as f:
+        for log in stereo_logs:
+            f.write(log + '\n')
+    if verbose:
+        print("Consolidated stereo log saved at {}".format(stereo_log_fn))
+
+    return
+
+
+def copy_match_files(match_files, out_folder):
+    print(f"Copying {len(match_files)} match files to: {out_folder}")
+    os.makedirs(out_folder, exist_ok=True)
+    for match_file in tqdm(match_files):
+        image_pair_string = os.path.dirname(match_file).split("/")[-1]
+        out_file = os.path.join(out_folder, "run-" + image_pair_string + ".match")
+        _ = shutil.copy2(match_file, out_file)
+    return
+
+
+# OPENCV
 def save_match_coords(filename, pts1, pts2):
     with open(filename, 'w') as f:
         f.write('pt1_x,pt1_y,pt2_x,pt2_y\n')  # Write header
@@ -302,7 +482,8 @@ def detect_and_match_features(
     image_folder: str,
     cam_specs_df: pd.DataFrame,
     out_folder: str,
-    nfeatures: int = 20000
+    nfeatures: int = 5000,
+    overwrite: bool = False
 ):
     print("\n--- Detecting and Matching Features ---")
     os.makedirs(out_folder, exist_ok=True)
@@ -335,7 +516,7 @@ def detect_and_match_features(
         match_pair_file = os.path.join(out_folder, f"{img1_name}__{img2_name}_match.csv")
 
         try:
-            if os.path.exists(match_pair_file):
+            if os.path.exists(match_pair_file) & (overwrite==False):
                 print(
                     f"\nMatches already exist for pair: {img1_name_ext}, {img2_name_ext}. Loading from file."
                 )
@@ -563,7 +744,7 @@ def unpack_params(params, n_base_poses, n_relative, n_points):
 
 def fun(
         params, 
-        n_base_poses,
+        n_base_poses, 
         n_relative, 
         n_points, 
         observations, 
@@ -572,46 +753,82 @@ def fun(
         base_pose_map, 
         relative_cam_map
         ):
-    base_params, relative_params, points_3d = unpack_params(params, n_base_poses, n_relative, n_points)
-    
-    # It is much faster to build a list and concatenate once at the end.
+    """
+    The cost function for the bundle adjustment, to be minimized by least_squares.
+
+    This function calculates the reprojection error for all observations. For a given
+    set of camera and point parameters, it projects every 3D point into every camera
+    that sees it and calculates the pixel distance between the projected point and
+    the originally observed feature point. The optimizer's goal is to adjust the
+    input `params` to make the sum of squares of these distances as small as possible.
+    """
+    # === 1. Unpack Parameters ===
+    # The optimizer provides one long flat vector of parameters. This step
+    # reshapes that vector back into structured, usable arrays for base poses,
+    # relative rig poses, and 3D point coordinates.
+    base_params, relative_params, points_3d = unpack_params(
+        params, n_base_poses, n_relative, n_points
+    )
+
     all_residuals = []
 
+    # === 2. Iterate Through Every Observation ===
     for obs in observations:
-        cam_idx = obs['cam_idx']
-        pt_3d_idx = obs['pt_3d_idx']
-        pt_2d_obs = obs['pt_2d']
-        
+        # Observation = 2D feature point seen in an image
+        cam_idx = obs["cam_idx"]      # The index of the camera
+        pt_3d_idx = obs["pt_3d_idx"]  # The index of the 3D point
+        pt_2d_obs = obs["pt_2d"]      # The measured (x, y) coordinates
+
+        # --- Get Camera Information ---
         cam_spec = cam_specs_df.iloc[cam_idx]
-        cam_type = cam_spec['cam']
-        K = cam_spec['K']
-        base_key = cam_spec['ref_base_key']
-        
-        if pd.isna(base_key) or base_key not in base_pose_map:
-            # Make sure the output size is correct, even if some observations are skipped.
-            all_residuals.append(np.array([0, 0])) 
+        cam_name = cam_spec["cam"] 
+        K = cam_spec["K"] 
+        base_key = cam_spec["ref_base_key"]
+
+        # Skip if this camera couldn't be associated with a base camera
+        if pd.isna(base_key) or (base_key not in base_pose_map):
+            all_residuals.append(np.array([0, 0]))
             continue
 
+        # Get the current estimate for the 3D point's coordinates.
         point_3d = points_3d[pt_3d_idx]
+
+        # === 3. Calculate the Final Absolute Pose of the Camera ===
+        
+        # --- Start with the pose of the reference camera for this time step ---
+        # Get the 6 pose parameters for the base/reference camera
         base_pose_params = base_params[base_pose_map[base_key]]
+        # Convert the 6 params into a standard 3x3 rotation matrix and 3x1 translation vector.
         R_base = Rotation.from_rotvec(base_pose_params[:3]).as_matrix()
         t_base = base_pose_params[3:].reshape(3, 1)
 
-        if cam_type == ref_cam_id:
+        # --- Combine with relative rig pose if this is not a reference camera ---
+        if cam_name == ref_cam_id:
+            # If this is a reference camera ('d1'), its pose is just the base pose.
             R_cam, t_cam = R_base, t_base
         else:
-            relative_pose_params = relative_params[relative_cam_map[cam_type]]
+            # If this is a non-reference camera, apply the rig geometry.
+            # Get the 6 parameters for the shared relative pose of this camera type.
+            relative_pose_params = relative_params[relative_cam_map[cam_name]]
             R_rel = Rotation.from_rotvec(relative_pose_params[:3]).as_matrix()
             t_rel = relative_pose_params[3:].reshape(3, 1)
+
+            # Compose the camera's absolute pose
             R_cam = R_base @ R_rel
             t_cam = R_base @ t_rel + t_base
 
+        # === 4. Project the 3D Point into the Camera ===
+        # x = K * [R|t] * X
         pt_proj = (K @ (R_cam @ point_3d.reshape(3, 1) + t_cam)).ravel()
+        
+        # Cconvert from homogeneous to 2D coordinates
         pt_proj_2d = pt_proj[:2] / pt_proj[2]
-        
-        # Append (x, y) error vector for this observation
+
+        # === 5. Calculate and Store the Residual (Reprojection Error) ===
+        # Reprojection error = difference between where the model projects the point
+        # and where the feature was actually observed in the image
         all_residuals.append(pt_proj_2d - pt_2d_obs)
-        
+
     return np.concatenate(all_residuals)
 
 
@@ -652,272 +869,362 @@ def calculate_and_save_stats(raw_residuals, observations, cam_specs_df, output_f
 
 
 def build_jacobian(
-        n_base_poses, 
-        n_relative, 
-        n_points, 
-        observations, 
-        cam_specs_df, 
-        ref_cam_id, 
-        base_pose_map, 
-        relative_cam_map
-        ):
+    n_base_poses, 
+    n_relative, 
+    n_points, 
+    observations, 
+    cam_specs_df, 
+    ref_cam_id, 
+    base_pose_map, 
+    relative_cam_map
+    ):
+    """
+    Builds the sparsity structure of the Jacobian matrix.
+
+    The Jacobian matrix represents the derivatives of each residual (reprojection error)
+    with respect to each optimization parameter. For large-scale bundle adjustment,
+    this matrix is enormous but also very sparse (mostly zeros).
+    """
+    # === 1. Calculate offsets and dimensions ===
     n_params_base = n_base_poses * 6
     n_params_relative = n_relative * 6
     n_params_total = n_params_base + n_params_relative + n_points * 3
-    
-    A = lil_matrix((len(observations) * 2, n_params_total), dtype=int)
-    
+    n_residuals = len(observations) * 2  
+
+    # Initialize a sparse matrix
+    A = lil_matrix((n_residuals, n_params_total), dtype=int)
+
+    # === 2. Iterate over observations ===
+    # Each observation's reprojection error depends on:
+    #   - Absolute pose of the observing camera
+    #   - 3D coordinates of the observed point
     for i, obs in enumerate(observations):
-        cam_idx = obs['cam_idx']
-        pt_3d_idx = obs['pt_3d_idx']
+        cam_idx = obs["cam_idx"]
+        pt_3d_idx = obs["pt_3d_idx"]
+
         cam_spec = cam_specs_df.iloc[cam_idx]
-        
-        # Use the pre-computed 'ref_base_key' to find the correct Jacobian entries
-        base_key = cam_spec['ref_base_key']
+        base_key = cam_spec["ref_base_key"]
+
         if pd.isna(base_key) or base_key not in base_pose_map:
             continue
-
-        # --- Jacobian for 3D point ---
-        pt_3d_start_idx = n_params_base + n_params_relative + pt_3d_idx * 3
-        A[i * 2: i * 2 + 2, pt_3d_start_idx: pt_3d_start_idx + 3] = 1
         
-        # --- Jacobian for Camera Pose ---
+        row_start = i * 2
+
+        # --- 3D Point ---
+        pt_3d_start_idx = n_params_base + n_params_relative + pt_3d_idx * 3
+        A[row_start : row_start + 2, pt_3d_start_idx : pt_3d_start_idx + 3] = 1
+
+        # --- Base Camera Pose ---
         base_pose_idx = base_pose_map[base_key]
         base_start_idx = base_pose_idx * 6
-        A[i * 2: i * 2 + 2, base_start_idx: base_start_idx + 6] = 1
-        
-        # Only add Jacobian for relative pose if cam is not a reference cam
-        if cam_spec['cam'] != ref_cam_id:
-            if cam_spec['cam'] in relative_cam_map:
-                relative_pose_idx = relative_cam_map[cam_spec['cam']]
+        A[row_start : row_start + 2, base_start_idx : base_start_idx + 6] = 1
+
+        # --- Relative Rig Pose ---
+        # (only if not observed by the reference camera)
+        if cam_spec["cam"] != ref_cam_id:
+            if cam_spec["cam"] in relative_cam_map:
+                relative_pose_idx = relative_cam_map[cam_spec["cam"]]
                 relative_start_idx = n_params_base + relative_pose_idx * 6
-                A[i * 2: i * 2 + 2, relative_start_idx: relative_start_idx + 6] = 1
-            
+                A[row_start : row_start + 2, relative_start_idx : relative_start_idx + 6] = 1
+
     return A
 
 
+def print_relative_poses(poses_dict, ref_cam_id, title):
+    """Prints the relative camera poses in a human-readable format."""
+    print(f"\n--- {title} (relative to '{ref_cam_id}') ---")
+    if not poses_dict:
+        print("No relative poses to display.")
+        return
+
+    for cam_id, pose in sorted(poses_dict.items()):
+        # Extract rotation and translation
+        R = pose['R']
+        t = pose['t'].ravel() # Flatten translation vector for printing
+
+        # Convert rotation matrix to Euler angles (in degrees) for readability
+        # The 'xyz' order is common, but can be changed if needed
+        euler_angles = Rotation.from_matrix(R).as_euler('xyz', degrees=True)
+
+        print(f"  Camera: '{cam_id}'")
+        print(f"    Translation (m): [x: {t[0]:.4f}, y: {t[1]:.4f}, z: {t[2]:.4f}]")
+        print(f"    Rotation (deg):  [roll: {euler_angles[0]:.4f}, pitch: {euler_angles[1]:.4f}, yaw: {euler_angles[2]:.4f}]")
+
+
 def bundle_adjust(
-    matches, 
+    matches,
     cam_specs_df,
     out_folder,
-    max_nfev = None,
-    threads: int = int(os.cpu_count() *0.75)
-):
+    max_nfev=None,
+    threads: int = int(os.cpu_count() * 0.75),
+):    
+    # --- Setup (largely unchanged) ---
     print("\nMapping all cameras to a reference camera")
-    # Find the camera with the most frames to use as the reference
-    ref_cam_id = cam_specs_df['cam'].value_counts().idxmax()
+    ref_cam_id = cam_specs_df["cam"].value_counts().idxmax()
     print(f"Using '{ref_cam_id}' as the reference camera (most frames).")
-
-    # Call the new generalized function to get a consistent initial guess
     initial_rig_poses = estimate_initial_rig_geometry(cam_specs_df, ref_cam_id)
-    
-    # Create a lookup for reference camera frames, grouped by datetime
-    ref_cams_df = cam_specs_df[cam_specs_df['cam'] == ref_cam_id].copy()
-    ref_frames_by_dt = {dt: sorted(group['frame'].astype(int).tolist()) for dt, group in ref_cams_df.groupby('datetime')}
-    ref_name_lookup = {(row['datetime'], row['frame']): row['image_name'] for _, row in ref_cams_df.iterrows()}
-
-    # Map every non-reference camera to a reference camera
-    cam_specs_df['ref_base_key'] = None
+    ref_cams_df = cam_specs_df[cam_specs_df["cam"] == ref_cam_id].copy()
+    ref_frames_by_dt = {
+        dt: sorted(group["frame"].astype(int).tolist())
+        for dt, group in ref_cams_df.groupby("datetime")
+    }
+    ref_name_lookup = {
+        (row["datetime"], row["frame"]): row["image_name"]
+        for _, row in ref_cams_df.iterrows()
+    }
+    cam_specs_df["ref_base_key"] = None
     for idx, row in tqdm(cam_specs_df.iterrows(), total=len(cam_specs_df), desc="Mapping frames"):
-        if row['cam'] == ref_cam_id:
-            cam_specs_df.at[idx, 'ref_base_key'] = row['image_name']
+        if row["cam"] == ref_cam_id:
+            cam_specs_df.at[idx, "ref_base_key"] = row["image_name"]
         else:
-            dt, frame = row['datetime'], row['frame']
+            dt, frame = row["datetime"], row["frame"]
             if dt in ref_frames_by_dt:
                 ref_frames = ref_frames_by_dt[dt]
                 closest_ref_frame = min(ref_frames, key=lambda x: abs(x - int(frame)))
                 closest_ref_frame_str = str(closest_ref_frame).zfill(4)
                 master_key = (dt, closest_ref_frame_str)
                 if master_key in ref_name_lookup:
-                    cam_specs_df.at[idx, 'ref_base_key'] = ref_name_lookup[master_key]
+                    cam_specs_df.at[idx, "ref_base_key"] = ref_name_lookup[master_key]
     
-    unmapped_cams = cam_specs_df[cam_specs_df['ref_base_key'].isnull()]
-    if not unmapped_cams.empty:
-        print("\nWARNING: The following cameras could not be mapped to a reference frame and will be ignored:")
-        print(unmapped_cams[['image_name', 'datetime', 'frame']])
-
     points_3d, observations = build_observation_data(matches, cam_specs_df)
-
-    unique_base_keys = sorted(cam_specs_df['ref_base_key'].dropna().unique())
+    unique_base_keys = sorted(cam_specs_df["ref_base_key"].dropna().unique())
     base_pose_map = {key: i for i, key in enumerate(unique_base_keys)}
-    
     relative_cams = sorted([cam for cam in cam_specs_df['cam'].unique() if cam != ref_cam_id])
     relative_cam_map = {cam: i for i, cam in enumerate(relative_cams)}
+    base_initial_poses = {name: {'R': cam['R'], 't': cam['t']} for name, cam in ref_cams_df.set_index("image_name").to_dict('index').items()}
     
-    base_initial_poses = ref_cams_df.set_index('image_name')[['R', 't']].to_dict('index')
-
-    # Ensure initial_rig_poses has an entry for every relative camera.
-    # If not, provide a default identity pose as a starting guess.
-    print("Verifying initial relative poses for all non-reference cameras")
     for cam in relative_cams:
         if cam not in initial_rig_poses:
             print(f"  WARNING: No initial relative pose calculated for '{cam}'. Using identity as starting guess.")
-            initial_rig_poses[cam] = {'R': np.eye(3), 't': np.zeros((3, 1))}
+            initial_rig_poses[cam] = {"R": np.eye(3), "t": np.zeros((3, 1))}
+
+    # --- Calculate the initial centroid ---
+    initial_centers = []
+    for pose in base_initial_poses.values():
+        initial_centers.append((-pose['R'].T @ pose['t']).ravel())
+    initial_centroid = np.mean(np.array(initial_centers), axis=0)
+    print(f"\nInitial trajectory centroid: {initial_centroid}")
 
     n_base_poses = len(unique_base_keys)
     n_relative = len(relative_cams)
     n_points = len(points_3d)
-
     initial_params = pack_params(base_initial_poses, initial_rig_poses, points_3d)
-
-    # Calculate and save initial point residuals
-    print("\nCalculating and saving initial residuals")
-    initial_residuals_raw = fun(
-        initial_params, n_base_poses, n_relative, n_points, observations,
-        cam_specs_df, ref_cam_id, base_pose_map, relative_cam_map
-    )
-    calculate_and_save_stats(
-        initial_residuals_raw, 
-        observations, cam_specs_df, 
-        os.path.join(out_folder, "initial_residuals.csv")
-        )
-
-    # Build the Jacobian (sparse matrix)
-    A = build_jacobian(
-        n_base_poses, 
-        n_relative, 
-        n_points, 
-        observations, 
-        cam_specs_df, 
-        ref_cam_id, 
-        base_pose_map, 
-        relative_cam_map
-        )
     
-    # Start the optimization
-    print("\nStarting optimization")
-    print(f"Optimizing {n_base_poses} base ('{ref_cam_id}') poses, {n_relative} relative rig poses, and {n_points} 3D points...")
-    print(f"Using {threads} workers (CPU)")
+    print_relative_poses(initial_rig_poses, ref_cam_id, "Initial Relative Rig Geometry")
+    
+    A = build_jacobian(n_base_poses, n_relative, n_points, observations, cam_specs_df, ref_cam_id, base_pose_map, relative_cam_map)
+
+    # --- Run the optimization ---
+    print("\nStarting optimization...")
     start_time = time.time()
     res = least_squares(
-        fun,
-        initial_params,
-        jac_sparsity=A,
-        verbose=2,
-        x_scale='jac',
-        ftol=1e-4,
-        method='trf',
-        max_nfev=max_nfev,
-        workers=threads,
-        args=(n_base_poses, n_relative, n_points, observations, cam_specs_df, ref_cam_id, base_pose_map, relative_cam_map)
+        fun, initial_params, jac_sparsity=A, verbose=2, x_scale="jac", ftol=1e-4, method="trf",
+        max_nfev=max_nfev, workers=threads,
+        args=(n_base_poses, n_relative, n_points, observations, cam_specs_df, ref_cam_id, base_pose_map, relative_cam_map),
     )
     end_time = time.time()
+    print(f"Optimization Finished. Total time = {np.round(end_time - start_time, 2)} seconds")
+
+    final_base_params_drifted, final_relative_params, final_points_3d_drifted = unpack_params(res.x, n_base_poses, n_relative, n_points)
+
+    # --- Calculate the final centroid and the required shift ---
+    final_centers_drifted = []
+    for i in range(n_base_poses):
+        R_drifted = Rotation.from_rotvec(final_base_params_drifted[i, :3]).as_matrix()
+        t_drifted = final_base_params_drifted[i, 3:].reshape(3, 1)
+        final_centers_drifted.append((-R_drifted.T @ t_drifted).ravel())
+    final_centroid_drifted = np.mean(np.array(final_centers_drifted), axis=0)
     
-    print("Optimization Finished")
-    print(f"Total optimization time = {np.round(end_time - start_time, 2)} seconds")
-    _, final_relative_params, _ = unpack_params(res.x, n_base_poses, n_relative, n_points)
+    shift_vector = initial_centroid - final_centroid_drifted
+    print(f"\nFinal drifted centroid:    {final_centroid_drifted}")
+    print(f"Alignment shift vector:    {shift_vector}")
 
-    print("\nCalculating and saving final residuals")
-    final_residuals_raw = res.fun
-    calculate_and_save_stats(
-        final_residuals_raw, observations, cam_specs_df, os.path.join(out_folder, "final_residuals.csv")
-    )
+    # --- Apply the alignment shift to ALL cameras and points ---
+    final_points_3d_aligned = final_points_3d_drifted + shift_vector
+    
+    final_base_params_aligned = final_base_params_drifted.copy()
+    for i in range(n_base_poses):
+        R = Rotation.from_rotvec(final_base_params_drifted[i, :3]).as_matrix()
+        C_drifted = final_centers_drifted[i]
+        C_aligned = C_drifted + shift_vector
+        t_aligned = -R @ C_aligned.reshape(3, 1)
+        final_base_params_aligned[i, 3:] = t_aligned.ravel()
 
-    # Calculate final poses
-    print("\nCalculating final camera poses")
-    # Unpack the optimized parameters
-    final_base_params, final_relative_params, final_points_3d = unpack_params(res.x, n_base_poses, n_relative, n_points)
-
-    # Create a copy of the specs dataframe to store final poses
+    # --- Use ALIGNED parameters for all subsequent steps ---
     final_cam_specs_df = cam_specs_df.copy()
-    
-    # Create look-up maps for final parameters
-    final_base_poses = {key: final_base_params[idx] for key, idx in base_pose_map.items()}
-    final_relative_poses = {key: final_relative_params[idx] for key, idx in relative_cam_map.items()}
-
-    # Loop through every camera and calculate its final absolute pose
     for idx, row in final_cam_specs_df.iterrows():
-        base_key = row['ref_base_key']
-        if pd.isna(base_key) or base_key not in final_base_poses:
-            continue # Skip unmapped cameras
-            
-        base_pose_params = final_base_poses[base_key]
+        base_key = row["ref_base_key"]
+        if pd.isna(base_key) or base_key not in base_pose_map:
+            continue
+        
+        base_pose_idx = base_pose_map[base_key]
+        base_pose_params = final_base_params_aligned[base_pose_idx]
         R_base = Rotation.from_rotvec(base_pose_params[:3]).as_matrix()
         t_base = base_pose_params[3:].reshape(3, 1)
 
-        if row['cam'] == ref_cam_id:
+        if row["cam"] == ref_cam_id:
             R_final, t_final = R_base, t_base
         else:
-            if row['cam'] in final_relative_poses:
-                relative_pose_params = final_relative_poses[row['cam']]
+            if row["cam"] in relative_cam_map:
+                relative_pose_idx = relative_cam_map[row["cam"]]
+                relative_pose_params = final_relative_params[relative_pose_idx]
                 R_rel = Rotation.from_rotvec(relative_pose_params[:3]).as_matrix()
                 t_rel = relative_pose_params[3:].reshape(3, 1)
-                
                 R_final = R_base @ R_rel
                 t_final = R_base @ t_rel + t_base
             else:
                 R_final, t_final = R_base, t_base
         
-        # Update the DataFrame with the new, optimized poses
-        final_cam_specs_df.at[idx, 'R'] = R_final
-        final_cam_specs_df.at[idx, 't'] = t_final
+        final_cam_specs_df.at[idx, "R"] = R_final
+        final_cam_specs_df.at[idx, "t"] = t_final
 
-    # Save final cam specs to file
+    # Print final relative poses for comparison
+    final_rig_poses_printable = {}
+    for cam, idx in relative_cam_map.items():
+        params = final_relative_params[idx]
+        R_rel = Rotation.from_rotvec(params[:3]).as_matrix()
+        t_rel = params[3:].reshape(3, 1)
+        final_rig_poses_printable[cam] = {'R': R_rel, 't': t_rel}        
+    print_relative_poses(final_rig_poses_printable, ref_cam_id, "Final Relative Rig Geometry")
+
+    # Save final camera files
     final_cam_specs_file = os.path.join(out_folder, "final_cam_specs.csv")
-    final_cam_specs_df.to_csv(final_cam_specs_file, index=False)
-    print(f"Final cameras saved to:\n{final_cam_specs_file}")
-
-    # Save individual TSAI camera models
+    save_cam_specs(final_cam_specs_df, final_cam_specs_file)
     opencv_cameras_to_asp_pinhole(final_cam_specs_df, out_folder)
 
     # Plot the results
     plot_rig_comparison(
-            initial_df=cam_specs_df,
-            final_df=final_cam_specs_df,
-            title=f"Camera Poses Before and After Optimization (Ref: '{ref_cam_id}')"
-        )
-
+        initial_df=cam_specs_df,
+        final_df=final_cam_specs_df,
+        title=f"Camera Poses Before and After Optimization (Ref: '{ref_cam_id}')",
+    )
     return
+
 
 
 ###############################
 # VISUALIZATION
 ###############################
 
-def plot_rig_comparison(initial_df, final_df, title="Initial vs. Final Camera Poses"):
-    print("\n--- Plotting initial vs. final camera poses ---")
-    fig = plt.figure(figsize=(12, 10))
-    ax = fig.add_subplot(111, projection='3d')
+def plot_rig_comparison(initial_df, final_df, title="Camera Pose Drift (X/Y Plane)"):
+    print("\n--- Plotting initial vs. final camera pose drift ---")
 
-    # Helper to plot a single set of poses
-    def plot_poses(df, color, label, linestyle='-'):
-        centers = []
+    # Helper function to calculate camera centers from a dataframe
+    def get_centers(df):
+        centers = {}
         for _, cam in df.iterrows():
-            R, t = cam['R'], cam['t']
+            # Ensure R and t are numpy arrays
+            R = np.array(cam['R'])
+            t = np.array(cam['t'])
             # Calculate camera center in world coordinates: C = -R.T @ t
-            center = -R.T @ t
-            centers.append(center)
-            
-            # Plot camera orientation axes
-            axis_len = 5
-            x_axis = R.T[:, 0] * axis_len
-            y_axis = R.T[:, 1] * axis_len
-            z_axis = R.T[:, 2] * axis_len
-            
-            ax.quiver(center[0], center[1], center[2], x_axis[0], x_axis[1], x_axis[2], color='blue', linestyle=linestyle, alpha=0.8)
-            ax.quiver(center[0], center[1], center[2], y_axis[0], y_axis[1], y_axis[2], color='green', linestyle=linestyle, alpha=0.8)
-            ax.quiver(center[0], center[1], center[2], z_axis[0], z_axis[1], z_axis[2], color='orange', linestyle=linestyle, alpha=0.8)
+            center = -R.T @ t.reshape(3, 1)
+            centers[cam['image_name']] = center.ravel()
+        return pd.DataFrame.from_dict(centers, orient='index', columns=['x', 'y', 'z'])
 
-        centers = np.array(centers).squeeze()
-        ax.scatter(centers[:, 0], centers[:, 1], centers[:, 2], c=color, marker='o', label=f'{label} Centers')
+    # Get initial and final centers
+    initial_centers = get_centers(initial_df)
+    final_centers = get_centers(final_df)
 
-    # Plot initial and final poses
-    plot_poses(initial_df, 'gray', 'Initial', linestyle='--')
-    plot_poses(final_df, 'black', 'Final', linestyle='-')
+    # Merge the dataframes to align initial and final poses
+    merged_df = initial_centers.join(final_centers, lsuffix='_init', rsuffix='_final')
 
+    # Calculate the components for the quiver plot
+    x_init = merged_df['x_init']
+    y_init = merged_df['y_init']
+    
+    # U and V are the vector components of the drift
+    u = merged_df['x_final'] - x_init
+    v = merged_df['y_final'] - y_init
+    
+    # Color the arrows by the change in the Z coordinate
+    delta_z = merged_df['z_final'] - merged_df['z_init']
+
+    # --- Plotting ---
+    fig, ax = plt.subplots(figsize=(12, 12))
+
+    quiver = ax.quiver(x_init, y_init, u, v, delta_z,
+                       angles='xy', scale_units='xy', scale=1, cmap='coolwarm',
+                       headwidth=4, headlength=5)
+
+    # Add a colorbar to explain the Z-drift colors
+    cbar = fig.colorbar(quiver)
+    cbar.set_label("Change in Z (m)")
+
+    # Add start and end points for clarity
+    ax.scatter(x_init, y_init, c='grey', marker='o', alpha=0.7, label='Initial Centers')
+    ax.scatter(merged_df['x_final'], merged_df['y_final'], c='black', marker='x', alpha=0.9, label='Final Centers')
+
+    # Formatting the plot
+    ax.set_title(title)
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
-    ax.set_zlabel("Z (m)")
-    ax.set_title(title)
     ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
     
-    # Try to make aspect ratio equal
-    try:
-        ax.set_aspect('equal')
-    except NotImplementedError:
-        print("Warning: 3D aspect ratio equalization not fully supported. Plot may be distorted.")
+    # Ensure the aspect ratio is equal, so drifts in the X and Y directions look the same
+    ax.set_aspect('equal')
 
     plt.show()
+
+
+def bundle_adjust_one_cam(
+        image_list: list[str] = None, 
+        cam_list: str = None, 
+        output_prefix: str = None,
+        refdem_file: str = None, 
+        refdem_uncertainty: float = 5, 
+        skip_matching: bool = False,
+        fixed_cam_indices: list[int] = None,
+        threads: int = int(os.cpu_count() * 0.75),
+        verbose: bool = True
+        ):
+    output_folder = os.path.dirname(output_prefix)
+    os.makedirs(output_folder, exist_ok=True)
+
+    # construct the arguments
+    args = [
+        "--threads", str(threads),
+        "--num-iterations", "500",
+        "--num-passes", "2",
+        "--inline-adjustments",
+        "--min-matches", "4",
+        "--disable-tri-ip-filter",
+        "--ip-per-tile", "4000",
+        "--ip-inlier-factor", "0.2",
+        "--ip-num-ransac-iterations", "1000",
+        "--skip-rough-homography", 
+        "--min-triangulation-angle", "0.0001",
+        "--remove-outliers-params", "75 3 5 6",
+        "--individually-normalize",
+        "-o", output_prefix
+        ] + image_list + cam_list
+
+    if skip_matching:
+        args += ["--force-reuse-match-files"]
+        args += ["--skip-matching"]
+
+    if refdem_file:
+        args += ["--heights-from-dem", refdem_file]
+        args += ["--heights-from-dem-uncertainty", str(refdem_uncertainty)]
+
+    if fixed_cam_indices:
+        args += ["--fixed-camera-indices", " ".join(fixed_cam_indices)]    
+
+    # run bundle adjust
+    log = run_cmd('parallel_bundle_adjust', args)
+
+    # write log to file
+    dt_now = datetime.now()
+    dt_now_string = str(dt_now).replace('-','').replace(' ','').replace(':','').replace('.','')
+    log_file = output_prefix + f'-parallel_bundle_adjust_{dt_now_string}.log'
+    with open(log_file, 'w') as f:
+        f.write(log)
+    
+    if verbose:
+        print('Saved compiled log to file:', log_file)
+        print('Bundle adjust complete.')
+        
+    return
 
 
 ###############################
@@ -968,8 +1275,7 @@ def main():
 
     # Save to file
     cam_specs_file = os.path.join(init_cam_folder, "initial_cam_specs.csv")
-    cam_specs_df.to_csv(cam_specs_file, index=False)
-    print(f"Initial camera specs saved to:\n{cam_specs_file}")
+    save_cam_specs(cam_specs_df, cam_specs_file)
     
     # Create a unique integer index for each camera for easy lookup
     cam_specs_df.reset_index(inplace=True, drop=True)
@@ -981,38 +1287,132 @@ def main():
     print("========================================")
     # Identify stereo pairs
     stereo_pairs_file = identify_stereo_pairs(
-        image_list, 
-        init_matches_folder, 
-        10, 
-        [0.25, 5], 
-        True, 
-        "EPSG:32611", 
-        True
+        img_list=image_list, 
+        out_folder=out_folder, 
+        overlap_perc=10, 
+        bh_ratio_range=[0.25, 5], 
+        true_stereo=True, 
+        utm_epsg="EPSG:32611",
+        write_basename=False
         )
     
     # Detect and match features
-    matches = detect_and_match_features(
-        stereo_pairs_file=stereo_pairs_file,
-        image_folder=image_folder,
-        cam_specs_df=cam_specs_df,
-        out_folder=init_matches_folder,
-        nfeatures=20000
-    )
-    if not matches:
-        print("\nNo feature matches found. Exiting before optimization.")
-        return
+    # run_stereo(
+    #     stereo_pairs_fn=stereo_pairs_file,
+    #     cam_list=init_cam_list,
+    #     out_folder=init_matches_folder,
+    #     stop_point=1,
+    #     threads=10
+    # )
+    
+    # Copy match files to bundle adjust folder
+    match_files = sorted(glob(os.path.join(init_matches_folder, "*", "*", "*.match")))
+    copy_match_files(match_files, ba_folder)
+
+    # matches = detect_and_match_features(
+    #     stereo_pairs_file=stereo_pairs_file,
+    #     image_folder=image_folder,
+    #     cam_specs_df=cam_specs_df,
+    #     out_folder=init_matches_folder,
+    #     nfeatures=5000,
+    #     overwrite=False
+    # )
+    # if not matches:
+    #     print("\nNo feature matches found. Exiting before optimization.")
+    #     return
     
     # -----Custom bundle adjustment-----
-    print("\n========================================")
-    print("BUNDLE ADJUSTMENT")
-    print("========================================")
-    bundle_adjust(
-        matches=matches,
-        cam_specs_df=cam_specs_df,
-        out_folder=ba_folder,
-        max_nfev=None,
-        threads=10
-    )
+    # print("\n========================================")
+    # print("BUNDLE ADJUSTMENT")
+    # print("========================================")
+
+    # ROUND 1: best triplet for reference cam
+    image_list_ref = [x for x in image_list if "d1" in os.path.basename(x)]
+    cam_list_ref = [x for x in init_cam_list if "d1" in os.path.basename(x)]
+
+    # subset stereo pairs to reference pairs
+    stereo_pairs = pd.read_csv(stereo_pairs_file, sep=" ", header=0)
+    stereo_pairs_ref = stereo_pairs.loc[stereo_pairs["img1"].isin(image_list_ref) & stereo_pairs["img2"].isin(image_list_ref)]
+    print(f"{len(stereo_pairs_ref)} reference stereo pairs")
+
+    # Identify the best starting triplet
+    def get_dt_from_fname(filename):
+        """Helper function to extract datetime from the SkySat filename."""
+        base = os.path.basename(filename)
+        dt_str = base.split('_')[0] + base.split('_')[1]
+        return datetime.strptime(dt_str, '%Y%m%d%H%M%S')
+
+    # Add datetime objects to the dataframe for easy comparison
+    stereo_pairs_ref['dt1'] = stereo_pairs_ref['img1'].apply(get_dt_from_fname)
+    stereo_pairs_ref['dt2'] = stereo_pairs_ref['img2'].apply(get_dt_from_fname)
+
+    all_valid_triplets = []
+
+    # Iterate through each stereo pair, considering it as the first link (A, B) in a chain
+    for _, ab_pair in stereo_pairs_ref.iterrows():
+        A, dt_A = ab_pair['img1'], ab_pair['dt1']
+        B, dt_B = ab_pair['img2'], ab_pair['dt2']
+        overlap_AB = ab_pair['overlap_percent']
+        
+        # Now, find all pairs that connect to B, which could be the second link (B, C)
+        # Exclude the pair we started with to avoid B->A connections
+        candidate_bc_pairs = stereo_pairs_ref[
+            ((stereo_pairs_ref['img1'] == B) & (stereo_pairs_ref['img2'] != A)) |
+            ((stereo_pairs_ref['img2'] == B) & (stereo_pairs_ref['img1'] != A))
+        ]
+        
+        for _, bc_pair in candidate_bc_pairs.iterrows():
+            # Determine which image is C and get its datetime
+            if bc_pair['img1'] == B:
+                C, dt_C = bc_pair['img2'], bc_pair['dt2']
+            else:
+                C, dt_C = bc_pair['img1'], bc_pair['dt1']
+            
+            overlap_BC = bc_pair['overlap_percent']
+
+            # Enforce the constraint: all three images must have different datetimes
+            if len({dt_A, dt_B, dt_C}) == 3:
+                mean_overlap = (overlap_AB + overlap_BC) / 2.0
+                all_valid_triplets.append({
+                    'triplet': [A, B, C],
+                    'mean_overlap': mean_overlap
+                })
+
+    if not all_valid_triplets:
+        raise ValueError("Could not find any valid triplets with distinct datetimes. Check stereo pair overlaps.")
+
+    # Find the single best triplet from all the valid ones we found
+    best_triplet_info = max(all_valid_triplets, key=lambda x: x['mean_overlap'])
+    triplet = best_triplet_info['triplet']
+
+    print("Using the following reference triplet for initial fixed cameras:")
+    print(f"(Based on a maximum mean overlap of {best_triplet_info['mean_overlap']:.2f}%)")
+    for img in triplet:
+        print(f"  {os.path.basename(img)}")
+
+    # Identify their indices in the image_list_ref, ensuring a consistent order
+    triplet_sorted = [img for img in image_list_ref if img in triplet]
+    fixed_cam_indices = [str(image_list_ref.index(img)) for img in triplet_sorted]
+
+    print("Fixed camera indices:", fixed_cam_indices)
+
+    # bundle_adjust_one_cam(
+    #     image_list=image_list_ref,
+    #     cam_list=cam_list_ref,
+    #     output_prefix=os.path.join(ba_folder, "run"),
+    #     skip_matching=True,
+    #     fixed_cam_indices=fixed_cam_indices
+    # )
+
+    # ROUND 2: all reference cams with first triplet fixed
+
+    # bundle_adjust(
+    #     matches=matches,
+    #     cam_specs_df=cam_specs_df,
+    #     out_folder=ba_folder,
+    #     max_nfev=None,
+    #     threads=10,
+    # )
 
 if __name__ == "__main__":
     main()
