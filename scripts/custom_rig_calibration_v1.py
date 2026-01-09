@@ -86,13 +86,13 @@ def save_cam_specs(df: pd.DataFrame, out_file: str):
 
     # Define a function to convert an array to its list string representation
     # e.g., np.array([[1, 2], [3, 4]]) -> '[[1, 2], [3, 4]]'
-    def array_to_list_str(arr):
+    def _array_to_list_str(arr):
         return str(arr.tolist())
 
     # Apply the conversion to each array column
     for col in ['K', 'R', 't']:
         if col in df_to_save.columns:
-            df_to_save[col] = df_to_save[col].apply(array_to_list_str)
+            df_to_save[col] = df_to_save[col].apply(_array_to_list_str)
 
     df_to_save.to_csv(out_file, index=False)
     print(f"Saved camera specs to:\n{out_file}")
